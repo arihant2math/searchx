@@ -1,81 +1,95 @@
-use http_client::policy::IpPolicy;
-use milli::documents::{DocumentsBatchBuilder, DocumentsBatchReader};
-use milli::progress::{EmbedderStats, Progress};
-use milli::update::{IndexDocuments, IndexDocumentsConfig, IndexDocumentsMethod, IndexerConfig};
+use milli::update::IndexerConfig;
 use milli::{CreateOrOpen, Index};
-use serde::{Deserialize, Serialize};
-use std::io::Cursor;
-use std::sync::Arc;
-use tempfile::tempdir;
+use searchx::{
+    DataPaths, ScanOptions, SyncStats, apply_index_changes, configure_index, data_paths,
+    load_manifest, new_heed_options, reset_data_dir, save_manifest, scan_root, search_index,
+};
+use std::error::Error;
+use std::fs;
+use std::path::Path;
 
-#[derive(Serialize, Deserialize, Debug)]
-struct File {
-    id: u32,
-    path: String,
-    contents: String,
+const DATA_DIR_NAME: &str = ".searchx-data";
+const DEFAULT_ROOT: &str = "/Users/anaren/Documents/oss/memchr";
+
+fn print_summary(root: &Path, data_paths: &DataPaths, stats: &SyncStats, max_file_bytes: u64) {
+    println!("Indexed root: {}", root.display());
+    println!("Index data: {}", data_paths.index.display());
+    println!("Scanned files: {}", stats.scanned_files);
+    println!("Indexed/updated documents: {}", stats.indexed_or_updated);
+    println!("Deleted documents: {}", stats.deleted_total());
+    println!(
+        "Skipped unchanged indexed files: {}",
+        stats.unchanged_indexed
+    );
+    println!(
+        "Skipped unchanged unsupported files: {}",
+        stats.unchanged_skipped
+    );
+    println!(
+        "Skipped oversized files (> {max_file_bytes} bytes): {}",
+        stats.skipped_too_large
+    );
+    println!("Skipped binary/non-UTF8 files: {}", stats.skipped_binary);
+    println!("Read errors: {}", stats.read_errors);
+    println!("Walk errors: {}", stats.walk_errors);
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let options = ScanOptions {
+        rebuild: false,
+        max_file_bytes: 1024 * 1024 * 50,
+    };
+    let query = Some("Hi".to_string());
+    let root = fs::canonicalize(DEFAULT_ROOT)?;
+    let data_paths = data_paths(DATA_DIR_NAME)?;
+
+    let manifest_load = load_manifest(&data_paths, &root, options.rebuild)?;
+    if let Some(reason) = &manifest_load.rebuild_reason {
+        eprintln!("Rebuilding index: {reason}");
+        reset_data_dir(&data_paths)?;
+    } else {
+        fs::create_dir_all(&data_paths.index)?;
+    }
+
+    let heed_options = new_heed_options();
+
+    let create_or_open = if data_paths.index.join("data.mdb").exists() {
+        CreateOrOpen::Open
+    } else {
+        CreateOrOpen::create_without_shards()
+    };
+
+    let index = Index::new(heed_options, &data_paths.index, create_or_open)?;
+    let indexer_config = IndexerConfig::default();
+
+    configure_index(&index, &indexer_config)?;
+
+    let scan = scan_root(&options, &root, &data_paths.base, &manifest_load.manifest)?;
+    if scan.updated_count > 0 || !scan.deleted_ids.is_empty() {
+        apply_index_changes(
+            &index,
+            &indexer_config,
+            &scan.updates_file,
+            scan.updated_count,
+            &scan.deleted_ids,
+        )?;
+        save_manifest(&data_paths.manifest, &scan.next_manifest)?;
+    } else if manifest_load.rebuild_reason.is_some() || !data_paths.manifest.exists() {
+        save_manifest(&data_paths.manifest, &scan.next_manifest)?;
+    }
+
+    print_summary(&root, &data_paths, &scan.stats, options.max_file_bytes);
+
+    if let Some(query) = query.as_deref().filter(|query| !query.trim().is_empty()) {
+        search_index(&index, query, 10)?;
+    }
+
+    Ok(())
 }
 
 fn main() {
-    let dir = tempdir().unwrap();
-    let mut options = milli::heed::EnvOpenOptions::new();
-    options.map_size(100 * 1024 * 1024); // 100 MB
-    let options = options.read_txn_without_tls();
-
-    let index = Index::new(options, dir.path(), CreateOrOpen::Create { shards: None }).unwrap();
-
-    let movies = vec![
-        File {
-            id: 1,
-            path: String::from("test.txt"),
-            contents: String::from("I love ice cream"),
-        },
-        File {
-            id: 2,
-            path: String::from("test2.txt"),
-            contents: String::from("It is cold outside"),
-        },
-    ];
-    let mut batch_builder = DocumentsBatchBuilder::new(Vec::new());
-    for movie in movies {
-        let value = serde_json::to_value(movie).unwrap();
-        batch_builder.append_json_object(value.as_object().unwrap()).unwrap();
-    }
-    let batch = batch_builder.into_inner().unwrap();
-
-    let mut wtxn = index.write_txn().unwrap();
-    let indexer_config = IndexerConfig::default();
-    let embedder_stats: Arc<EmbedderStats> = Default::default();
-    let reader = DocumentsBatchReader::from_reader(Cursor::new(batch)).unwrap();
-    let ip_policy = IpPolicy::danger_always_allow();
-    let index_documents = IndexDocuments::new(
-        &mut wtxn,
-        &index,
-        &indexer_config,
-        IndexDocumentsConfig {
-            update_method: IndexDocumentsMethod::ReplaceDocuments,
-            ..Default::default()
-        },
-        |_| {},
-        || false,
-        &embedder_stats,
-        &ip_policy,
-    )
-    .unwrap();
-    let (index_documents, indexed_count) = index_documents.add_documents(reader).unwrap();
-    println!("Indexed {} documents.", indexed_count.unwrap());
-    index_documents.execute().unwrap();
-    wtxn.commit().unwrap();
-
-    let rtxn = index.read_txn().unwrap();
-    let progress = Progress::default();
-    let mut search = milli::Search::new(&rtxn, &index, &progress);
-    search.query("cold");
-    search.limit(10);
-
-    let result = search.execute().unwrap();
-    println!("Found {} documents:", result.candidates.len());
-
-    for doc_id in result.candidates {
-        println!("Document ID matched: {:?}", doc_id);
+    if let Err(error) = run() {
+        eprintln!("error: {error}");
+        std::process::exit(1);
     }
 }

@@ -1,0 +1,628 @@
+use bumpalo::Bump;
+use http_client::policy::IpPolicy;
+use ignore::{DirEntry, WalkBuilder};
+use memmap2::Mmap;
+use milli::heed::{EnvOpenOptions, WithoutTls};
+use milli::progress::{EmbedderStats, Progress};
+use milli::update::new::indexer;
+use milli::update::{IndexerConfig, MissingDocumentPolicy, Settings};
+use milli::{Index, all_obkv_to_json};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::error::Error;
+use std::ffi::OsStr;
+use std::fs;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+use tempfile::NamedTempFile;
+
+const MANIFEST_VERSION: u32 = 1;
+const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
+const PRIMARY_KEY: &str = "id";
+const SEARCHABLE_FIELDS: [&str; 4] = ["file_name", "path", "contents", "extension"];
+
+#[derive(Debug)]
+pub struct ScanOptions {
+    pub rebuild: bool,
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct DataPaths {
+    pub base: PathBuf,
+    pub index: PathBuf,
+    pub manifest: PathBuf,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct Manifest {
+    version: u32,
+    root: String,
+    files: BTreeMap<String, ManifestEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct ManifestEntry {
+    size: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    state: FileState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+enum FileState {
+    Indexed,
+    Skipped { reason: SkipReason },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    TooLarge,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileFingerprint {
+    size: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+}
+
+#[derive(Serialize, Debug)]
+struct IndexedDocument {
+    id: String,
+    path: String,
+    file_name: String,
+    extension: Option<String>,
+    contents: String,
+}
+
+#[derive(Debug, Default)]
+pub struct SyncStats {
+    pub scanned_files: u64,
+    pub unchanged_indexed: u64,
+    pub unchanged_skipped: u64,
+    pub indexed_or_updated: u64,
+    pub deleted_missing: u64,
+    pub deleted_became_unsupported: u64,
+    pub skipped_too_large: u64,
+    pub skipped_binary: u64,
+    pub read_errors: u64,
+    pub walk_errors: u64,
+}
+
+#[derive(Debug)]
+pub struct ScanOutcome {
+    pub next_manifest: Manifest,
+    pub updates_file: NamedTempFile,
+    pub updated_count: usize,
+    pub deleted_ids: Vec<String>,
+    pub stats: SyncStats,
+}
+
+#[derive(Debug)]
+pub struct ManifestLoad {
+    pub manifest: Manifest,
+    pub rebuild_reason: Option<String>,
+}
+
+impl ManifestEntry {
+    fn from_fingerprint(fingerprint: FileFingerprint, state: FileState) -> Self {
+        Self {
+            size: fingerprint.size,
+            modified_secs: fingerprint.modified_secs,
+            modified_nanos: fingerprint.modified_nanos,
+            state,
+        }
+    }
+
+    fn matches(&self, fingerprint: FileFingerprint) -> bool {
+        self.size == fingerprint.size
+            && self.modified_secs == fingerprint.modified_secs
+            && self.modified_nanos == fingerprint.modified_nanos
+    }
+
+    fn is_indexed(&self) -> bool {
+        matches!(self.state, FileState::Indexed)
+    }
+}
+
+impl FileFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+
+        Self {
+            size: metadata.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+        }
+    }
+}
+
+impl SyncStats {
+    pub fn deleted_total(&self) -> u64 {
+        self.deleted_missing + self.deleted_became_unsupported
+    }
+}
+
+pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> Result<DataPaths, Box<dyn Error>> {
+    let base = env::current_dir()?.join(data_dir);
+    Ok(DataPaths {
+        index: base.join("index"),
+        manifest: base.join("manifest.json"),
+        base,
+    })
+}
+
+pub fn load_manifest(
+    data_paths: &DataPaths,
+    root: &Path,
+    force_rebuild: bool,
+) -> Result<ManifestLoad, Box<dyn Error>> {
+    let empty_manifest = Manifest {
+        version: MANIFEST_VERSION,
+        root: root.display().to_string(),
+        files: BTreeMap::new(),
+    };
+
+    if force_rebuild {
+        return Ok(ManifestLoad {
+            manifest: empty_manifest,
+            rebuild_reason: Some("forced by --rebuild".to_string()),
+        });
+    }
+
+    if !data_paths.manifest.exists() {
+        let existing_index = data_paths.index.join("data.mdb").exists();
+        return Ok(ManifestLoad {
+            manifest: empty_manifest,
+            rebuild_reason: existing_index.then(|| "manifest is missing".to_string()),
+        });
+    }
+
+    let contents = fs::read_to_string(&data_paths.manifest)?;
+    let manifest: Manifest = match serde_json::from_str(&contents) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Ok(ManifestLoad {
+                manifest: empty_manifest,
+                rebuild_reason: Some(format!("manifest could not be parsed: {error}")),
+            });
+        }
+    };
+
+    if manifest.version != MANIFEST_VERSION {
+        return Ok(ManifestLoad {
+            manifest: empty_manifest,
+            rebuild_reason: Some(format!(
+                "manifest version {} does not match {}",
+                manifest.version, MANIFEST_VERSION
+            )),
+        });
+    }
+
+    if manifest.root != root.display().to_string() {
+        return Ok(ManifestLoad {
+            manifest: empty_manifest,
+            rebuild_reason: Some(format!(
+                "manifest root {} does not match {}",
+                manifest.root,
+                root.display()
+            )),
+        });
+    }
+
+    Ok(ManifestLoad {
+        manifest,
+        rebuild_reason: None,
+    })
+}
+
+pub fn reset_data_dir(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
+    if data_paths.base.exists() {
+        fs::remove_dir_all(&data_paths.base)?;
+    }
+    fs::create_dir_all(&data_paths.index)?;
+    Ok(())
+}
+
+pub fn configure_index(
+    index: &Index,
+    indexer_config: &IndexerConfig,
+) -> Result<(), Box<dyn Error>> {
+    let desired_searchable_fields = SEARCHABLE_FIELDS
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+
+    let rtxn = index.read_txn()?;
+    let current_primary_key = index.primary_key(&rtxn)?.map(str::to_string);
+    let current_searchable_fields = index
+        .user_defined_searchable_fields(&rtxn)?
+        .map(|fields| fields.into_iter().map(str::to_string).collect::<Vec<_>>());
+    drop(rtxn);
+
+    if current_primary_key.as_deref() == Some(PRIMARY_KEY)
+        && current_searchable_fields.as_deref() == Some(desired_searchable_fields.as_slice())
+    {
+        return Ok(());
+    }
+
+    let mut wtxn = index.write_txn()?;
+    let mut settings = Settings::new(&mut wtxn, index, indexer_config);
+    settings.set_primary_key(PRIMARY_KEY.to_string());
+    settings.set_searchable_fields(desired_searchable_fields);
+    settings.execute(
+        &|| false,
+        &Progress::default(),
+        &IpPolicy::danger_always_allow(),
+        Arc::<EmbedderStats>::default(),
+    )?;
+    wtxn.commit()?;
+
+    Ok(())
+}
+
+pub fn scan_root(
+    options: &ScanOptions,
+    root: &Path,
+    data_dir: &Path,
+    previous: &Manifest,
+) -> Result<ScanOutcome, Box<dyn Error>> {
+    let mut next_manifest = Manifest {
+        version: MANIFEST_VERSION,
+        root: root.display().to_string(),
+        files: BTreeMap::new(),
+    };
+    let mut deleted_ids = BTreeSet::new();
+    let mut stats = SyncStats::default();
+    let mut updates_file = NamedTempFile::new_in(data_dir)?;
+    let mut writer = BufWriter::new(updates_file.as_file_mut());
+    let data_dir = data_dir.to_path_buf();
+
+    let walker = WalkBuilder::new(root)
+        .filter_entry(move |entry| should_walk_entry(entry, &data_dir))
+        .build();
+
+    for result in walker {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                stats.walk_errors += 1;
+                eprintln!("walk error: {error}");
+                continue;
+            }
+        };
+
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let relative_path = normalize_relative_path(path, root)?;
+        stats.scanned_files += 1;
+
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                stats.read_errors += 1;
+                eprintln!("metadata error for {}: {error}", path.display());
+                if let Some(previous_entry) = previous.files.get(&relative_path) {
+                    next_manifest
+                        .files
+                        .insert(relative_path, previous_entry.clone());
+                }
+                continue;
+            }
+        };
+
+        let fingerprint = FileFingerprint::from_metadata(&metadata);
+        if let Some(previous_entry) = previous.files.get(&relative_path)
+            && previous_entry.matches(fingerprint)
+        {
+            next_manifest
+                .files
+                .insert(relative_path.clone(), previous_entry.clone());
+            if previous_entry.is_indexed() {
+                stats.unchanged_indexed += 1;
+            } else {
+                stats.unchanged_skipped += 1;
+            }
+            continue;
+        }
+
+        if metadata.len() > options.max_file_bytes {
+            handle_unsupported_file(
+                &relative_path,
+                fingerprint,
+                SkipReason::TooLarge,
+                previous,
+                &mut next_manifest,
+                &mut deleted_ids,
+                &mut stats,
+            );
+            continue;
+        }
+
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                stats.read_errors += 1;
+                eprintln!("read error for {}: {error}", path.display());
+                if let Some(previous_entry) = previous.files.get(&relative_path) {
+                    next_manifest
+                        .files
+                        .insert(relative_path, previous_entry.clone());
+                }
+                continue;
+            }
+        };
+
+        if bytes.contains(&0) {
+            handle_unsupported_file(
+                &relative_path,
+                fingerprint,
+                SkipReason::Binary,
+                previous,
+                &mut next_manifest,
+                &mut deleted_ids,
+                &mut stats,
+            );
+            continue;
+        }
+
+        let contents = match String::from_utf8(bytes) {
+            Ok(contents) => contents,
+            Err(_) => {
+                handle_unsupported_file(
+                    &relative_path,
+                    fingerprint,
+                    SkipReason::Binary,
+                    previous,
+                    &mut next_manifest,
+                    &mut deleted_ids,
+                    &mut stats,
+                );
+                continue;
+            }
+        };
+
+        let document = IndexedDocument {
+            id: document_id_for_path(&relative_path),
+            path: relative_path.clone(),
+            file_name: path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .to_string(),
+            extension: path.extension().and_then(OsStr::to_str).map(str::to_string),
+            contents,
+        };
+
+        serde_json::to_writer(&mut writer, &document)?;
+        writer.write_all(b"\n")?;
+        next_manifest.files.insert(
+            relative_path,
+            ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed),
+        );
+        stats.indexed_or_updated += 1;
+    }
+
+    writer.flush()?;
+    drop(writer);
+
+    for (path, entry) in &previous.files {
+        if entry.is_indexed() && !next_manifest.files.contains_key(path) {
+            deleted_ids.insert(document_id_for_path(path));
+            stats.deleted_missing += 1;
+        }
+    }
+
+    Ok(ScanOutcome {
+        next_manifest,
+        updates_file,
+        updated_count: stats.indexed_or_updated as usize,
+        deleted_ids: deleted_ids.into_iter().collect(),
+        stats,
+    })
+}
+
+fn handle_unsupported_file(
+    relative_path: &str,
+    fingerprint: FileFingerprint,
+    reason: SkipReason,
+    previous: &Manifest,
+    next_manifest: &mut Manifest,
+    deleted_ids: &mut BTreeSet<String>,
+    stats: &mut SyncStats,
+) {
+    match reason {
+        SkipReason::TooLarge => stats.skipped_too_large += 1,
+        SkipReason::Binary => stats.skipped_binary += 1,
+    }
+
+    if previous
+        .files
+        .get(relative_path)
+        .is_some_and(ManifestEntry::is_indexed)
+    {
+        deleted_ids.insert(document_id_for_path(relative_path));
+        stats.deleted_became_unsupported += 1;
+    }
+
+    next_manifest.files.insert(
+        relative_path.to_string(),
+        ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason }),
+    );
+}
+
+fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {
+    if entry.path().starts_with(data_dir) {
+        return false;
+    }
+
+    if entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+    {
+        return !matches!(
+            entry.file_name().to_str(),
+            Some(
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | ".next"
+                    | ".turbo"
+                    | ".cache"
+                    | "coverage"
+                    | "__pycache__"
+                    | ".venv"
+                    | "venv"
+                    | ".pytest_cache"
+                    | ".mypy_cache"
+                    | ".ruff_cache"
+            )
+        );
+    }
+
+    true
+}
+
+fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, Box<dyn Error>> {
+    let relative = path.strip_prefix(root)?;
+    Ok(relative
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+fn document_id_for_path(relative_path: &str) -> String {
+    blake3::hash(relative_path.as_bytes()).to_hex().to_string()
+}
+
+pub fn apply_index_changes(
+    index: &Index,
+    indexer_config: &IndexerConfig,
+    updates_file: &NamedTempFile,
+    updated_count: usize,
+    deleted_ids: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let mut wtxn = index.write_txn()?;
+    let rtxn = index.read_txn()?;
+    let db_fields_ids_map = index.fields_ids_map(&rtxn)?;
+    let mut new_fields_ids_map = db_fields_ids_map.clone();
+    let ip_policy = IpPolicy::danger_always_allow();
+    let embedders = milli::update::InnerIndexSettings::from_index(index, &rtxn, &ip_policy, None)?
+        .runtime_embedders;
+
+    let mut operations = indexer::IndexOperations::new();
+    let mmap = if updated_count > 0 {
+        Some(unsafe { Mmap::map(updates_file.as_file())? })
+    } else {
+        None
+    };
+
+    if let Some(mmap) = &mmap {
+        operations.replace_documents(mmap, MissingDocumentPolicy::default())?;
+    }
+
+    let deleted_refs = deleted_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    if !deleted_refs.is_empty() {
+        operations.delete_documents_by_external_ids(&deleted_refs);
+    }
+
+    let indexer_alloc = Bump::new();
+    let (document_changes, operation_stats, primary_key) = operations.into_changes(
+        &indexer_alloc,
+        index,
+        &rtxn,
+        None,
+        &mut new_fields_ids_map,
+        &|| false,
+        Progress::default(),
+        None,
+    )?;
+
+    if let Some(error) = operation_stats.into_iter().find_map(|stat| stat.error) {
+        return Err(Box::new(error));
+    }
+
+    indexer::index(
+        &mut wtxn,
+        index,
+        &indexer_config.thread_pool,
+        indexer_config.grenad_parameters(),
+        &db_fields_ids_map,
+        new_fields_ids_map,
+        primary_key,
+        &document_changes,
+        embedders,
+        &|| false,
+        &Progress::default(),
+        &ip_policy,
+        &EmbedderStats::default(),
+    )?;
+    wtxn.commit()?;
+
+    Ok(())
+}
+
+pub fn save_manifest(path: &Path, manifest: &Manifest) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    serde_json::to_writer_pretty(file.as_file_mut(), manifest)?;
+    file.as_file_mut().write_all(b"\n")?;
+    file.as_file_mut().sync_all()?;
+    file.persist(path)?;
+
+    Ok(())
+}
+
+pub fn search_index(index: &Index, query: &str, limit: usize) -> Result<(), Box<dyn Error>> {
+    let rtxn = index.read_txn()?;
+    let progress = Progress::default();
+    let mut search = milli::Search::new(&rtxn, index, &progress);
+    search.query(query);
+    search.limit(limit);
+
+    let result = search.execute()?;
+    println!();
+    println!("Query: {query}");
+    println!("Found {} matching documents.", result.candidates.len());
+
+    let fields_ids_map = index.fields_ids_map(&rtxn)?;
+    for (rank, (_docid, obkv)) in index
+        .documents(&rtxn, result.documents_ids)?
+        .into_iter()
+        .enumerate()
+    {
+        let document = all_obkv_to_json(obkv, &fields_ids_map)?;
+        let path = document
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        println!("{}. {}", rank + 1, path);
+    }
+
+    Ok(())
+}
+
+pub fn new_heed_options() -> EnvOpenOptions<WithoutTls> {
+    let mut heed_options = milli::heed::EnvOpenOptions::new();
+    heed_options.map_size(DEFAULT_MAP_SIZE_BYTES);
+    heed_options.read_txn_without_tls()
+}
