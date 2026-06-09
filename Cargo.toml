@@ -11,8 +11,10 @@ path = "src/lib.rs"
 blake3 = "1.8.2"
 bumpalo = "3.19.0"
 clap = { version = "4.5.40", features = ["derive"] }
+fastembed = "5.16.0"
 http-client = { git = "https://github.com/meilisearch/meilisearch.git", tag = "v1.46.1", package = "http-client" }
 ignore = "0.4.25"
+indexmap = "2.14.0"
 memmap2 = "0.9.9"
 milli = { git = "https://github.com/meilisearch/meilisearch.git", tag = "v1.46.1" }
 rusqlite = { version = "0.32.1", features = ["bundled"] }

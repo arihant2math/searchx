@@ -1,5 +1,6 @@
 mod api;
 mod constants;
+mod embedding;
 mod error;
 mod index;
 mod manifest;

@@ -4,6 +4,7 @@ use milli::Index;
 use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use indexmap::IndexMap;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -79,6 +80,7 @@ pub struct SearchResults {
     pub query: String,
     pub candidate_count: u64,
     pub hits: Vec<SearchHit>,
+    pub timings: IndexMap<String, String>,
 }
 
 #[must_use]

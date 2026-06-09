@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use fastembed::{EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions, TextEmbedding};
 use tempfile::NamedTempFile;
 
 pub(crate) type IndexedVectors = BTreeMap<String, Option<Vec<f32>>>;
@@ -67,10 +68,13 @@ pub fn configure_index(index: &Index, indexer_config: &IndexerConfig) -> Searchx
 }
 
 #[must_use]
-pub fn generate_document_vector(_relative_path: &str, _contents: &str) -> Option<Vec<f32>> {
+pub fn generate_document_vector(relative_path: &str, contents: &str) -> Option<Vec<f32>> {
     None
 }
 
+/// Get all vectors for a document, keyed by embedder name.
+///
+/// Currently only supports one embedder, but this should be configurable
 pub(crate) fn document_vectors(relative_path: &str, contents: &str) -> IndexedVectors {
     let mut vectors = BTreeMap::new();
     vectors.insert(
@@ -204,6 +208,7 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<S
 
     Ok(SearchResults {
         query: query.to_string(),
+        timings: progress.accumulated_durations(),
         candidate_count,
         hits,
     })
@@ -211,7 +216,7 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<S
 
 #[must_use]
 pub fn new_heed_options() -> EnvOpenOptions<WithoutTls> {
-    let mut heed_options = milli::heed::EnvOpenOptions::new();
+    let mut heed_options = EnvOpenOptions::new();
     heed_options.map_size(DEFAULT_MAP_SIZE_BYTES);
     heed_options.read_txn_without_tls()
 }
