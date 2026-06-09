@@ -1,5 +1,8 @@
 use clap::Parser;
-use searchx::{DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, ScanOptions, SearchxResult, SyncIndexResult, SyncProgress, SyncRequest, sync_index_with_progress, default_ignore_rules};
+use searchx::{
+    DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, ScanOptions, SearchxResult, SyncIndexResult,
+    SyncProgress, SyncRequest, default_ignore_rules, sync_index_with_progress,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
