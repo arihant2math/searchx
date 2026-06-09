@@ -26,6 +26,8 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
+type SearchxResult<T> = Result<T, Box<dyn Error>>;
+
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
 const INCOMPLETE_FILE_NAME: &str = "indexing-incomplete";
@@ -85,6 +87,7 @@ pub struct SyncRequest {
 }
 
 impl SyncRequest {
+    #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -93,11 +96,13 @@ impl SyncRequest {
         }
     }
 
+    #[must_use]
     pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
         self.data_dir = data_dir.into();
         self
     }
 
+    #[must_use]
     pub fn with_options(mut self, options: ScanOptions) -> Self {
         self.options = options;
         self
@@ -133,6 +138,7 @@ pub struct SearchResults {
     pub hits: Vec<SearchHit>,
 }
 
+#[must_use]
 pub fn default_ignore_rules() -> Vec<String> {
     DEFAULT_IGNORE_RULES
         .iter()
@@ -162,6 +168,7 @@ impl<T> Default for OptionalCell<T> {
 }
 
 impl<T> OptionalCell<T> {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             value: Mutex::new(None),
@@ -178,6 +185,7 @@ impl<T> OptionalCell<T> {
 }
 
 impl<T: Clone> OptionalCell<T> {
+    #[must_use]
     pub fn get(&self) -> Option<T> {
         lock_unpoisoned(&self.value).clone()
     }
@@ -189,6 +197,7 @@ pub struct ScanHook {
 }
 
 impl ScanHook {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -201,6 +210,7 @@ impl ScanHook {
         self.current_file.clear();
     }
 
+    #[must_use]
     pub fn current_file(&self) -> Option<String> {
         self.current_file.get()
     }
@@ -349,6 +359,7 @@ pub struct ManifestLoad {
 }
 
 impl Manifest {
+    #[must_use]
     pub fn new(root: &Path) -> Self {
         Self {
             version: MANIFEST_VERSION,
@@ -396,6 +407,7 @@ impl FileFingerprint {
 }
 
 impl SyncStats {
+    #[must_use]
     pub fn deleted_total(&self) -> u64 {
         self.deleted_missing + self.deleted_became_unsupported
     }
@@ -556,9 +568,29 @@ fn i64_from_u64(value: u64, field: &str) -> Result<i64, Box<dyn Error>> {
         .map_err(|_| format!("manifest {field} value {value} exceeds sqlite INTEGER range").into())
 }
 
-fn u64_from_i64(value: i64, field: &str) -> Result<u64, Box<dyn Error>> {
+fn u64_from_i64(value: i64, field: &str) -> SearchxResult<u64> {
     u64::try_from(value)
         .map_err(|_| format!("manifest {field} value {value} is negative and invalid").into())
+}
+
+fn manifest_load_with_reason(root: &Path, rebuild_reason: Option<String>) -> ManifestLoad {
+    ManifestLoad {
+        manifest: Manifest::new(root),
+        rebuild_reason,
+    }
+}
+
+fn rebuild_manifest_load(root: &Path, reason: impl Into<String>) -> ManifestLoad {
+    manifest_load_with_reason(root, Some(reason.into()))
+}
+
+fn missing_manifest_load(root: &Path, data_paths: &DataPaths) -> ManifestLoad {
+    let rebuild_reason = data_paths
+        .index
+        .join("data.mdb")
+        .exists()
+        .then(|| "manifest is missing".to_string());
+    manifest_load_with_reason(root, rebuild_reason)
 }
 
 pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> Result<DataPaths, Box<dyn Error>> {
@@ -588,85 +620,66 @@ pub fn load_manifest(
     data_paths: &DataPaths,
     root: &Path,
     force_rebuild: bool,
-) -> Result<ManifestLoad, Box<dyn Error>> {
-    let empty_manifest = Manifest::new(root);
-
+) -> SearchxResult<ManifestLoad> {
     if force_rebuild {
-        return Ok(ManifestLoad {
-            manifest: empty_manifest,
-            rebuild_reason: Some("forced by --rebuild".to_string()),
-        });
+        return Ok(rebuild_manifest_load(root, "forced by --rebuild"));
     }
 
     if data_paths.incomplete_marker.exists() {
-        return Ok(ManifestLoad {
-            manifest: empty_manifest,
-            rebuild_reason: Some("previous indexing run did not complete cleanly".to_string()),
-        });
+        return Ok(rebuild_manifest_load(
+            root,
+            "previous indexing run did not complete cleanly",
+        ));
     }
 
     if !data_paths.manifest.exists() {
-        let existing_index = data_paths.index.join("data.mdb").exists();
-        return Ok(ManifestLoad {
-            manifest: empty_manifest,
-            rebuild_reason: existing_index.then(|| "manifest is missing".to_string()),
-        });
+        return Ok(missing_manifest_load(root, data_paths));
     }
 
     let conn = match open_manifest_connection(&data_paths.manifest) {
         Ok(conn) => conn,
         Err(error) => {
-            return Ok(ManifestLoad {
-                manifest: empty_manifest,
-                rebuild_reason: Some(format!("manifest could not be opened: {error}")),
-            });
+            return Ok(rebuild_manifest_load(
+                root,
+                format!("manifest could not be opened: {error}"),
+            ));
         }
     };
 
     let Some((version, manifest_root)) = (match load_manifest_info(&conn) {
         Ok(info) => info,
         Err(error) => {
-            return Ok(ManifestLoad {
-                manifest: empty_manifest,
-                rebuild_reason: Some(format!("manifest could not be read: {error}")),
-            });
+            return Ok(rebuild_manifest_load(
+                root,
+                format!("manifest could not be read: {error}"),
+            ));
         }
     }) else {
-        let existing_index = data_paths.index.join("data.mdb").exists();
-        return Ok(ManifestLoad {
-            manifest: empty_manifest,
-            rebuild_reason: existing_index.then(|| "manifest is missing".to_string()),
-        });
+        return Ok(missing_manifest_load(root, data_paths));
     };
 
     if version != MANIFEST_VERSION {
-        return Ok(ManifestLoad {
-            manifest: empty_manifest,
-            rebuild_reason: Some(format!(
-                "manifest version {} does not match {}",
-                version, MANIFEST_VERSION
-            )),
-        });
+        return Ok(rebuild_manifest_load(
+            root,
+            format!("manifest version {version} does not match {MANIFEST_VERSION}"),
+        ));
     }
 
     let root_display = root.display().to_string();
     if manifest_root != root_display {
-        return Ok(ManifestLoad {
-            manifest: empty_manifest,
-            rebuild_reason: Some(format!(
-                "manifest root {} does not match {}",
-                manifest_root, root_display
-            )),
-        });
+        return Ok(rebuild_manifest_load(
+            root,
+            format!("manifest root {manifest_root} does not match {root_display}"),
+        ));
     }
 
     let files = match load_manifest_files(&conn) {
         Ok(files) => files,
         Err(error) => {
-            return Ok(ManifestLoad {
-                manifest: empty_manifest,
-                rebuild_reason: Some(format!("manifest could not be read: {error}")),
-            });
+            return Ok(rebuild_manifest_load(
+                root,
+                format!("manifest could not be read: {error}"),
+            ));
         }
     };
 
@@ -724,6 +737,7 @@ pub fn configure_index(
     Ok(())
 }
 
+#[must_use]
 pub fn generate_document_vector(_relative_path: &str, _contents: &str) -> Option<Vec<f32>> {
     None
 }
@@ -742,171 +756,256 @@ pub fn scan_root(
     root: &Path,
     data_dir: &Path,
     previous: &Manifest,
-    scan_hook: Option<Arc<ScanHook>>,
-    pipeline: ScanPipeline,
-) -> Result<SyncStats, Box<dyn Error>> {
-    let mut seen_paths = HashSet::with_capacity(previous.files.len().saturating_mul(2));
-    let mut stats = SyncStats::default();
-    let progress_manifest = pipeline
-        .progress_manifest_db
-        .as_deref()
-        .map(ManifestWorkingSet::open)
-        .transpose()?;
+    scan_hook: Option<&ScanHook>,
+    pipeline: &ScanPipeline,
+) -> SearchxResult<SyncStats> {
+    ScanContext::new(options, root, previous, scan_hook, pipeline)?.run(data_dir)
+}
 
-    let mut walker_builder = WalkBuilder::new(root);
-    walker_builder
-        .hidden(false)
-        .require_git(false)
-        .current_dir(root);
+struct ScanContext<'a> {
+    options: &'a ScanOptions,
+    root: &'a Path,
+    previous: &'a Manifest,
+    scan_hook: Option<&'a ScanHook>,
+    error_sender: Option<&'a mpsc::Sender<ScanError>>,
+    event_sender: &'a mpsc::SyncSender<IndexEvent>,
+    cancel_flag: &'a AtomicBool,
+    progress_manifest: Option<ManifestWorkingSet>,
+    seen_paths: HashSet<String>,
+    stats: SyncStats,
+}
 
-    let custom_ignore_file = build_ignore_file(data_dir, &options.ignore_rules)?;
-    if let Some(ignore_file) = &custom_ignore_file
-        && let Some(error) = walker_builder.add_ignore(ignore_file.path())
-    {
-        return Err(Box::new(error));
+impl<'a> ScanContext<'a> {
+    fn new(
+        options: &'a ScanOptions,
+        root: &'a Path,
+        previous: &'a Manifest,
+        scan_hook: Option<&'a ScanHook>,
+        pipeline: &'a ScanPipeline,
+    ) -> SearchxResult<Self> {
+        let progress_manifest = pipeline
+            .progress_manifest_db
+            .as_deref()
+            .map(ManifestWorkingSet::open)
+            .transpose()?;
+
+        Ok(Self {
+            options,
+            root,
+            previous,
+            scan_hook,
+            error_sender: pipeline.error_sender.as_ref(),
+            event_sender: &pipeline.event_sender,
+            cancel_flag: pipeline.cancel_flag.as_ref(),
+            progress_manifest,
+            seen_paths: HashSet::with_capacity(previous.files.len().saturating_mul(2)),
+            stats: SyncStats::default(),
+        })
     }
 
-    let data_dir = data_dir.to_path_buf();
-    let walker = walker_builder
-        .filter_entry(move |entry| should_walk_entry(entry, &data_dir))
-        .build();
+    fn run(mut self, data_dir: &Path) -> SearchxResult<SyncStats> {
+        let result = self.run_inner(data_dir);
+        if let Some(scan_hook) = self.scan_hook {
+            scan_hook.clear_current_file();
+        }
+        result.map(|()| self.stats)
+    }
 
-    for result in walker {
-        if pipeline.cancel_flag.load(Ordering::Relaxed) {
-            return Err("scan canceled".into());
+    fn run_inner(&mut self, data_dir: &Path) -> SearchxResult<()> {
+        let mut walker_builder = WalkBuilder::new(self.root);
+        walker_builder
+            .hidden(false)
+            .require_git(false)
+            .current_dir(self.root);
+
+        let custom_ignore_file = build_ignore_file(data_dir, &self.options.ignore_rules)?;
+        if let Some(ignore_file) = &custom_ignore_file
+            && let Some(error) = walker_builder.add_ignore(ignore_file.path())
+        {
+            return Err(Box::new(error));
         }
 
-        let entry = match result {
-            Ok(entry) => entry,
-            Err(error) => {
-                stats.walk_errors += 1;
-                report_scan_error(
-                    pipeline.error_sender.as_ref(),
-                    ScanError::walk(error.to_string()),
-                );
-                continue;
-            }
-        };
+        let data_dir = data_dir.to_path_buf();
+        let walker = walker_builder
+            .filter_entry(move |entry| should_walk_entry(entry, &data_dir))
+            .build();
 
+        for result in walker {
+            self.ensure_not_canceled()?;
+
+            match result {
+                Ok(entry) => self.scan_entry(&entry)?,
+                Err(error) => {
+                    self.stats.walk_errors += 1;
+                    self.report_error(ScanError::walk(error.to_string()));
+                }
+            }
+        }
+
+        self.delete_missing_documents()
+    }
+
+    fn ensure_not_canceled(&self) -> SearchxResult<()> {
+        if self.cancel_flag.load(Ordering::Relaxed) {
+            Err("scan canceled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn scan_entry(&mut self, entry: &DirEntry) -> SearchxResult<()> {
         let Some(file_type) = entry.file_type() else {
-            continue;
+            return Ok(());
         };
         if !file_type.is_file() {
-            continue;
+            return Ok(());
         }
 
         let path = entry.path();
-        let relative_path = normalize_relative_path(path, root)?;
-        seen_paths.insert(relative_path.clone());
-        if let Some(scan_hook) = scan_hook.as_ref() {
+        let relative_path = normalize_relative_path(path, self.root)?;
+        self.seen_paths.insert(relative_path.clone());
+        if let Some(scan_hook) = self.scan_hook {
             scan_hook.set_current_file(relative_path.clone());
         }
-        stats.scanned_files += 1;
+        self.stats.scanned_files += 1;
 
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                stats.read_errors += 1;
-                report_scan_error(
-                    pipeline.error_sender.as_ref(),
-                    ScanError::metadata(path.display().to_string(), error.to_string()),
-                );
-                if let Some(previous_entry) = previous.files.get(&relative_path) {
-                    update_progress_manifest_entry(
-                        progress_manifest.as_ref(),
-                        &relative_path,
-                        previous_entry,
-                    )?;
-                }
-                continue;
-            }
+        let Some(metadata) = self.read_metadata(&relative_path, path)? else {
+            return Ok(());
         };
 
         let fingerprint = FileFingerprint::from_metadata(&metadata);
-        if let Some(previous_entry) = previous.files.get(&relative_path)
+        if let Some(previous_entry) = self.previous.files.get(&relative_path).cloned()
             && previous_entry.matches(fingerprint)
         {
-            update_progress_manifest_entry(
-                progress_manifest.as_ref(),
-                &relative_path,
-                previous_entry,
-            )?;
-            if previous_entry.is_indexed() {
-                stats.unchanged_indexed += 1;
-            } else {
-                stats.unchanged_skipped += 1;
-            }
-            continue;
+            self.mark_unchanged(&relative_path, &previous_entry)?;
+            return Ok(());
         }
 
-        if metadata.len() > options.max_file_bytes {
-            handle_unsupported_file(
-                &relative_path,
-                fingerprint,
-                SkipReason::TooLarge,
-                previous,
-                progress_manifest.as_ref(),
-                &pipeline.event_sender,
-                &pipeline.cancel_flag,
-                &mut stats,
-            )?;
-            continue;
+        if metadata.len() > self.options.max_file_bytes {
+            self.mark_unsupported(&relative_path, fingerprint, SkipReason::TooLarge)?;
+            return Ok(());
         }
 
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                stats.read_errors += 1;
-                report_scan_error(
-                    pipeline.error_sender.as_ref(),
-                    ScanError::read(path.display().to_string(), error.to_string()),
-                );
-                if let Some(previous_entry) = previous.files.get(&relative_path) {
-                    update_progress_manifest_entry(
-                        progress_manifest.as_ref(),
-                        &relative_path,
-                        previous_entry,
-                    )?;
-                }
-                continue;
-            }
+        let Some(bytes) = self.read_bytes(&relative_path, path)? else {
+            return Ok(());
         };
 
         if bytes.contains(&0) {
-            handle_unsupported_file(
-                &relative_path,
-                fingerprint,
-                SkipReason::Binary,
-                previous,
-                progress_manifest.as_ref(),
-                &pipeline.event_sender,
-                &pipeline.cancel_flag,
-                &mut stats,
-            )?;
-            continue;
+            self.mark_unsupported(&relative_path, fingerprint, SkipReason::Binary)?;
+            return Ok(());
         }
 
-        let contents = match String::from_utf8(bytes) {
-            Ok(contents) => contents,
-            Err(_) => {
-                handle_unsupported_file(
-                    &relative_path,
-                    fingerprint,
-                    SkipReason::Binary,
-                    previous,
-                    progress_manifest.as_ref(),
-                    &pipeline.event_sender,
-                    &pipeline.cancel_flag,
-                    &mut stats,
-                )?;
-                continue;
-            }
+        let Ok(contents) = String::from_utf8(bytes) else {
+            self.mark_unsupported(&relative_path, fingerprint, SkipReason::Binary)?;
+            return Ok(());
         };
 
-        let vectors = document_vectors(&relative_path, &contents);
+        self.index_document(&relative_path, path, fingerprint, contents)
+    }
+
+    fn read_metadata(
+        &mut self,
+        relative_path: &str,
+        path: &Path,
+    ) -> SearchxResult<Option<fs::Metadata>> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) => {
+                self.stats.read_errors += 1;
+                self.report_error(ScanError::metadata(
+                    path.display().to_string(),
+                    error.to_string(),
+                ));
+                self.preserve_previous_entry(relative_path)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn read_bytes(&mut self, relative_path: &str, path: &Path) -> SearchxResult<Option<Vec<u8>>> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) => {
+                self.stats.read_errors += 1;
+                self.report_error(ScanError::read(
+                    path.display().to_string(),
+                    error.to_string(),
+                ));
+                self.preserve_previous_entry(relative_path)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn preserve_previous_entry(&self, relative_path: &str) -> SearchxResult<()> {
+        if let Some(previous_entry) = self.previous.files.get(relative_path) {
+            update_progress_manifest_entry(
+                self.progress_manifest.as_ref(),
+                relative_path,
+                previous_entry,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn mark_unchanged(
+        &mut self,
+        relative_path: &str,
+        previous_entry: &ManifestEntry,
+    ) -> SearchxResult<()> {
+        update_progress_manifest_entry(
+            self.progress_manifest.as_ref(),
+            relative_path,
+            previous_entry,
+        )?;
+        if previous_entry.is_indexed() {
+            self.stats.unchanged_indexed += 1;
+        } else {
+            self.stats.unchanged_skipped += 1;
+        }
+        Ok(())
+    }
+
+    fn mark_unsupported(
+        &mut self,
+        relative_path: &str,
+        fingerprint: FileFingerprint,
+        reason: SkipReason,
+    ) -> SearchxResult<()> {
+        match reason {
+            SkipReason::TooLarge => self.stats.skipped_too_large += 1,
+            SkipReason::Binary => self.stats.skipped_binary += 1,
+        }
+
+        if self
+            .previous
+            .files
+            .get(relative_path)
+            .is_some_and(ManifestEntry::is_indexed)
+        {
+            send_index_event(
+                self.event_sender,
+                self.cancel_flag,
+                IndexEvent::Delete(document_id_for_path(relative_path)),
+            )?;
+            self.stats.deleted_became_unsupported += 1;
+        }
+
+        let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
+        update_progress_manifest_entry(self.progress_manifest.as_ref(), relative_path, &entry)
+    }
+
+    fn index_document(
+        &mut self,
+        relative_path: &str,
+        path: &Path,
+        fingerprint: FileFingerprint,
+        contents: String,
+    ) -> SearchxResult<()> {
+        let vectors = document_vectors(relative_path, &contents);
         let document = IndexedDocument {
-            id: document_id_for_path(&relative_path),
-            path: relative_path.clone(),
+            id: document_id_for_path(relative_path),
+            path: relative_path.to_string(),
             file_name: path
                 .file_name()
                 .and_then(OsStr::to_str)
@@ -917,71 +1016,40 @@ pub fn scan_root(
             vectors,
         };
         let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed);
-        update_progress_manifest_entry(progress_manifest.as_ref(), &relative_path, &entry)?;
+        update_progress_manifest_entry(self.progress_manifest.as_ref(), relative_path, &entry)?;
         send_index_event(
-            &pipeline.event_sender,
-            &pipeline.cancel_flag,
+            self.event_sender,
+            self.cancel_flag,
             IndexEvent::Upsert(serde_json::to_string(&document)?),
         )?;
-        stats.indexed_or_updated += 1;
+        self.stats.indexed_or_updated += 1;
+        Ok(())
     }
 
-    for (path, entry) in &previous.files {
-        if entry.is_indexed() && !seen_paths.contains(path) {
-            send_index_event(
-                &pipeline.event_sender,
-                &pipeline.cancel_flag,
-                IndexEvent::Delete(document_id_for_path(path)),
-            )?;
-            stats.deleted_missing += 1;
+    fn delete_missing_documents(&mut self) -> SearchxResult<()> {
+        for (path, entry) in &self.previous.files {
+            if entry.is_indexed() && !self.seen_paths.contains(path) {
+                send_index_event(
+                    self.event_sender,
+                    self.cancel_flag,
+                    IndexEvent::Delete(document_id_for_path(path)),
+                )?;
+                self.stats.deleted_missing += 1;
+            }
         }
+        Ok(())
     }
 
-    if let Some(scan_hook) = scan_hook.as_ref() {
-        scan_hook.clear_current_file();
+    fn report_error(&self, error: ScanError) {
+        report_scan_error(self.error_sender, error);
     }
-
-    Ok(stats)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_unsupported_file(
-    relative_path: &str,
-    fingerprint: FileFingerprint,
-    reason: SkipReason,
-    previous: &Manifest,
-    progress_manifest: Option<&ManifestWorkingSet>,
-    event_sender: &mpsc::SyncSender<IndexEvent>,
-    cancel_flag: &AtomicBool,
-    stats: &mut SyncStats,
-) -> Result<(), Box<dyn Error>> {
-    match reason {
-        SkipReason::TooLarge => stats.skipped_too_large += 1,
-        SkipReason::Binary => stats.skipped_binary += 1,
-    }
-
-    if previous
-        .files
-        .get(relative_path)
-        .is_some_and(ManifestEntry::is_indexed)
-    {
-        send_index_event(
-            event_sender,
-            cancel_flag,
-            IndexEvent::Delete(document_id_for_path(relative_path)),
-        )?;
-        stats.deleted_became_unsupported += 1;
-    }
-
-    let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
-    update_progress_manifest_entry(progress_manifest, relative_path, &entry)
 }
 
 fn send_index_event(
     event_sender: &mpsc::SyncSender<IndexEvent>,
     cancel_flag: &AtomicBool,
     event: IndexEvent,
-) -> Result<(), Box<dyn Error>> {
+) -> SearchxResult<()> {
     if cancel_flag.load(Ordering::Relaxed) {
         return Err("indexing canceled".into());
     }
@@ -992,7 +1060,9 @@ fn send_index_event(
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn update_progress_manifest_entry(
@@ -1167,7 +1237,7 @@ pub fn discard_working_manifest(path: &Path) -> Result<(), Box<dyn Error>> {
     clear_working_manifest(&conn)
 }
 
-fn panic_message(payload: Box<dyn Any + Send + 'static>) -> String {
+fn panic_message(payload: &(dyn Any + Send + 'static)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -1208,154 +1278,171 @@ fn report_sync_progress<F>(
     }
 }
 
-fn flush_index_batch(
-    index: &Index,
-    indexer_config: &IndexerConfig,
-    data_paths: &DataPaths,
-    pending_upserts: &mut Vec<String>,
-    pending_deleted_ids: &mut Vec<String>,
-    pending_bytes: &mut usize,
-) -> Result<(), Box<dyn Error>> {
-    if pending_upserts.is_empty() && pending_deleted_ids.is_empty() {
-        return Ok(());
+#[derive(Default)]
+struct PendingIndexBatch {
+    upserts: Vec<String>,
+    deleted_ids: Vec<String>,
+    bytes: usize,
+}
+
+impl PendingIndexBatch {
+    fn push(&mut self, event: IndexEvent) {
+        match event {
+            IndexEvent::Upsert(document) => {
+                self.bytes += document.len();
+                self.upserts.push(document);
+            }
+            IndexEvent::Delete(document_id) => self.deleted_ids.push(document_id),
+        }
     }
 
-    apply_index_batch(
-        index,
-        indexer_config,
-        &data_paths.base,
-        pending_upserts,
-        pending_deleted_ids,
-    )?;
+    fn should_flush(&self) -> bool {
+        self.upserts.len() >= INDEX_BATCH_DOC_LIMIT
+            || self.deleted_ids.len() >= INDEX_BATCH_DELETE_LIMIT
+            || self.bytes >= INDEX_BATCH_BYTE_LIMIT
+    }
 
-    pending_upserts.clear();
-    pending_deleted_ids.clear();
-    *pending_bytes = 0;
-    Ok(())
+    fn flush(
+        &mut self,
+        index: &Index,
+        indexer_config: &IndexerConfig,
+        data_paths: &DataPaths,
+    ) -> SearchxResult<()> {
+        if self.upserts.is_empty() && self.deleted_ids.is_empty() {
+            return Ok(());
+        }
+
+        apply_index_batch(
+            index,
+            indexer_config,
+            &data_paths.base,
+            &self.upserts,
+            &self.deleted_ids,
+        )?;
+
+        self.upserts.clear();
+        self.deleted_ids.clear();
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+fn cancel_scan_thread(
+    scan_handle: thread::JoinHandle<Result<SyncStats, String>>,
+    cancel_flag: &AtomicBool,
+    manifest_path: &Path,
+) {
+    cancel_flag.store(true, Ordering::Relaxed);
+    let _ = scan_handle.join();
+    discard_working_manifest_quietly(manifest_path);
+}
+
+fn finish_scan_thread(
+    scan_handle: thread::JoinHandle<Result<SyncStats, String>>,
+    manifest_path: &Path,
+) -> SearchxResult<SyncStats> {
+    match scan_handle.join() {
+        Ok(Ok(summary)) => Ok(summary),
+        Ok(Err(error)) => {
+            discard_working_manifest_quietly(manifest_path);
+            Err(error.into())
+        }
+        Err(payload) => {
+            discard_working_manifest_quietly(manifest_path);
+            Err(format!("scan thread panicked: {}", panic_message(payload.as_ref())).into())
+        }
+    }
+}
+
+struct StreamScanJob<'a> {
+    index: &'a Index,
+    indexer_config: &'a IndexerConfig,
+    options: &'a ScanOptions,
+    root: &'a Path,
+    data_paths: &'a DataPaths,
+    previous_manifest: Manifest,
 }
 
 fn stream_scan_into_index<F>(
-    index: &Index,
-    indexer_config: &IndexerConfig,
-    options: &ScanOptions,
-    root: &Path,
-    data_paths: &DataPaths,
-    previous_manifest: Manifest,
-    scan_hook: Arc<ScanHook>,
+    job: StreamScanJob<'_>,
+    scan_hook: &Arc<ScanHook>,
     on_progress: &mut F,
-) -> Result<SyncStats, Box<dyn Error>>
+) -> SearchxResult<SyncStats>
 where
     F: FnMut(SyncProgress),
 {
+    let StreamScanJob {
+        index,
+        indexer_config,
+        options,
+        root,
+        data_paths,
+        previous_manifest,
+    } = job;
+
     let (event_tx, event_rx) = mpsc::sync_channel(INDEX_EVENT_CHANNEL_CAPACITY);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let scan_options = options.clone();
     let scan_root_path = root.to_path_buf();
     let scan_data_dir = data_paths.base.clone();
     let scan_manifest_path = data_paths.manifest.clone();
-    let scan_hook_for_thread = scan_hook.clone();
-    let cancel_flag_for_thread = cancel_flag.clone();
+    let scan_hook_for_thread = Arc::clone(scan_hook);
+    let cancel_flag_for_thread = Arc::clone(&cancel_flag);
     let (scan_error_tx, scan_error_rx) = mpsc::channel();
 
     let scan_handle = thread::spawn(move || {
+        let pipeline = ScanPipeline {
+            progress_manifest_db: Some(scan_manifest_path),
+            error_sender: Some(scan_error_tx),
+            event_sender: event_tx,
+            cancel_flag: cancel_flag_for_thread,
+        };
+
         scan_root(
             &scan_options,
             &scan_root_path,
             &scan_data_dir,
             &previous_manifest,
-            Some(scan_hook_for_thread),
-            ScanPipeline {
-                progress_manifest_db: Some(scan_manifest_path),
-                error_sender: Some(scan_error_tx),
-                event_sender: event_tx,
-                cancel_flag: cancel_flag_for_thread,
-            },
+            Some(scan_hook_for_thread.as_ref()),
+            &pipeline,
         )
         .map_err(|error| error.to_string())
     });
 
     let mut last_reported_file = None;
-    let mut pending_upserts = Vec::new();
-    let mut pending_deleted_ids = Vec::new();
-    let mut pending_bytes = 0usize;
+    let mut pending_batch = PendingIndexBatch::default();
 
     let scan_result = loop {
         drain_scan_errors(&scan_error_rx, on_progress);
-        report_sync_progress(&scan_hook, &mut last_reported_file, on_progress);
+        report_sync_progress(scan_hook, &mut last_reported_file, on_progress);
 
         match event_rx.recv_timeout(PROGRESS_POLL_INTERVAL) {
             Ok(event) => {
-                match event {
-                    IndexEvent::Upsert(document) => {
-                        pending_bytes += document.len();
-                        pending_upserts.push(document);
-                    }
-                    IndexEvent::Delete(document_id) => pending_deleted_ids.push(document_id),
-                }
-
-                if (pending_upserts.len() >= INDEX_BATCH_DOC_LIMIT
-                    || pending_deleted_ids.len() >= INDEX_BATCH_DELETE_LIMIT
-                    || pending_bytes >= INDEX_BATCH_BYTE_LIMIT)
-                    && let Err(error) = flush_index_batch(
-                        index,
-                        indexer_config,
-                        data_paths,
-                        &mut pending_upserts,
-                        &mut pending_deleted_ids,
-                        &mut pending_bytes,
-                    )
+                pending_batch.push(event);
+                if pending_batch.should_flush()
+                    && let Err(error) = pending_batch.flush(index, indexer_config, data_paths)
                 {
-                    cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
-                    let _ = scan_handle.join();
-                    discard_working_manifest_quietly(&data_paths.manifest);
+                    cancel_scan_thread(scan_handle, &cancel_flag, &data_paths.manifest);
                     return Err(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = flush_index_batch(
-                    index,
-                    indexer_config,
-                    data_paths,
-                    &mut pending_upserts,
-                    &mut pending_deleted_ids,
-                    &mut pending_bytes,
-                ) {
-                    cancel_flag.store(true, Ordering::Relaxed);
+                if let Err(error) = pending_batch.flush(index, indexer_config, data_paths) {
                     drop(event_rx);
-                    let _ = scan_handle.join();
-                    discard_working_manifest_quietly(&data_paths.manifest);
+                    cancel_scan_thread(scan_handle, &cancel_flag, &data_paths.manifest);
                     return Err(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break match scan_handle.join() {
-                    Ok(Ok(summary)) => summary,
-                    Ok(Err(error)) => {
-                        discard_working_manifest_quietly(&data_paths.manifest);
-                        return Err(error.into());
-                    }
-                    Err(payload) => {
-                        discard_working_manifest_quietly(&data_paths.manifest);
-                        return Err(
-                            format!("scan thread panicked: {}", panic_message(payload)).into()
-                        );
-                    }
-                };
+                break finish_scan_thread(scan_handle, &data_paths.manifest)?;
             }
         }
     };
 
     drain_scan_errors(&scan_error_rx, on_progress);
 
-    if let Err(error) = flush_index_batch(
-        index,
-        indexer_config,
-        data_paths,
-        &mut pending_upserts,
-        &mut pending_deleted_ids,
-        &mut pending_bytes,
-    ) {
+    if let Err(error) = pending_batch.flush(index, indexer_config, data_paths) {
         discard_working_manifest_quietly(&data_paths.manifest);
         return Err(error);
     }
@@ -1406,13 +1493,15 @@ where
 
     let scan_hook = Arc::new(ScanHook::new());
     let stats = stream_scan_into_index(
-        &index,
-        &indexer_config,
-        &request.options,
-        &root,
-        &data_paths,
-        manifest,
-        scan_hook,
+        StreamScanJob {
+            index: &index,
+            indexer_config: &indexer_config,
+            options: &request.options,
+            root: &root,
+            data_paths: &data_paths,
+            previous_manifest: manifest,
+        },
+        &scan_hook,
         &mut on_progress,
     )?;
 
@@ -1473,6 +1562,7 @@ pub fn search_index(
     })
 }
 
+#[must_use]
 pub fn new_heed_options() -> EnvOpenOptions<WithoutTls> {
     let mut heed_options = milli::heed::EnvOpenOptions::new();
     heed_options.map_size(DEFAULT_MAP_SIZE_BYTES);
@@ -1516,7 +1606,7 @@ mod tests {
             data_dir,
             &empty_manifest(root),
             None,
-            ScanPipeline {
+            &ScanPipeline {
                 progress_manifest_db: None,
                 error_sender: None,
                 event_sender: event_tx,
