@@ -9,6 +9,7 @@ use milli::update::{IndexerConfig, MissingDocumentPolicy, Setting, Settings};
 use milli::vector::VectorStoreBackend;
 use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
 use milli::{Index, all_obkv_to_json};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -23,6 +24,7 @@ use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 
 const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
 const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const PRIMARY_KEY: &str = "id";
 pub const VECTOR_EMBEDDER_NAME: &str = "default";
@@ -187,7 +189,7 @@ impl Display for ScanError {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct Manifest {
     version: u32,
     root: String,
@@ -316,11 +318,171 @@ impl SyncStats {
     }
 }
 
+struct ManifestWorkingSet {
+    conn: Connection,
+}
+
+impl ManifestWorkingSet {
+    fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+        let conn = open_manifest_connection(path)?;
+        clear_working_manifest(&conn)?;
+        Ok(Self { conn })
+    }
+
+    fn update_entry(
+        &self,
+        relative_path: &str,
+        entry: &ManifestEntry,
+    ) -> Result<(), Box<dyn Error>> {
+        let (state, skip_reason) = file_state_to_db(&entry.state);
+        self.conn.execute(
+            "INSERT INTO working_manifest_files \
+                (path, size, modified_secs, modified_nanos, state, skip_reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(path) DO UPDATE SET
+                size = excluded.size,
+                modified_secs = excluded.modified_secs,
+                modified_nanos = excluded.modified_nanos,
+                state = excluded.state,
+                skip_reason = excluded.skip_reason",
+            params![
+                relative_path,
+                i64_from_u64(entry.size, "size")?,
+                i64_from_u64(entry.modified_secs, "modified_secs")?,
+                i64::from(entry.modified_nanos),
+                state,
+                skip_reason,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+fn open_manifest_connection(path: &Path) -> Result<Connection, Box<dyn Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         CREATE TABLE IF NOT EXISTS manifest_info (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             version INTEGER NOT NULL,
+             root TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS manifest_files (
+             path TEXT PRIMARY KEY,
+             size INTEGER NOT NULL,
+             modified_secs INTEGER NOT NULL,
+             modified_nanos INTEGER NOT NULL,
+             state TEXT NOT NULL,
+             skip_reason TEXT
+         );
+         CREATE TABLE IF NOT EXISTS working_manifest_files (
+             path TEXT PRIMARY KEY,
+             size INTEGER NOT NULL,
+             modified_secs INTEGER NOT NULL,
+             modified_nanos INTEGER NOT NULL,
+             state TEXT NOT NULL,
+             skip_reason TEXT
+         );",
+    )?;
+    Ok(conn)
+}
+
+fn clear_working_manifest(conn: &Connection) -> Result<(), Box<dyn Error>> {
+    conn.execute("DELETE FROM working_manifest_files", [])?;
+    Ok(())
+}
+
+fn load_manifest_info(conn: &Connection) -> Result<Option<(u32, String)>, Box<dyn Error>> {
+    let info = conn
+        .query_row(
+            "SELECT version, root FROM manifest_info WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(info)
+}
+
+fn load_manifest_files(
+    conn: &Connection,
+) -> Result<BTreeMap<String, ManifestEntry>, Box<dyn Error>> {
+    let mut statement = conn.prepare(
+        "SELECT path, size, modified_secs, modified_nanos, state, skip_reason
+         FROM manifest_files",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut files = BTreeMap::new();
+
+    while let Some(row) = rows.next()? {
+        let path = row.get::<_, String>(0)?;
+        let state_name = row.get::<_, String>(4)?;
+        let skip_reason = row.get::<_, Option<String>>(5)?;
+        let state = file_state_from_db(&state_name, skip_reason.as_deref())?;
+        files.insert(
+            path,
+            ManifestEntry {
+                size: u64_from_i64(row.get::<_, i64>(1)?, "size")?,
+                modified_secs: u64_from_i64(row.get::<_, i64>(2)?, "modified_secs")?,
+                modified_nanos: u32::try_from(row.get::<_, i64>(3)?)?,
+                state,
+            },
+        );
+    }
+
+    Ok(files)
+}
+
+fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
+    match state {
+        FileState::Indexed => ("indexed", None),
+        FileState::Skipped {
+            reason: SkipReason::TooLarge,
+        } => ("skipped", Some("too_large")),
+        FileState::Skipped {
+            reason: SkipReason::Binary,
+        } => ("skipped", Some("binary")),
+    }
+}
+
+fn file_state_from_db(state: &str, skip_reason: Option<&str>) -> Result<FileState, Box<dyn Error>> {
+    match (state, skip_reason) {
+        ("indexed", None) => Ok(FileState::Indexed),
+        ("skipped", Some("too_large")) => Ok(FileState::Skipped {
+            reason: SkipReason::TooLarge,
+        }),
+        ("skipped", Some("binary")) => Ok(FileState::Skipped {
+            reason: SkipReason::Binary,
+        }),
+        ("indexed", Some(reason)) => {
+            Err(format!("indexed entry cannot have skip reason {reason}").into())
+        }
+        ("skipped", None) => Err("skipped entry is missing a skip reason".into()),
+        (state, reason) => {
+            Err(format!("invalid manifest state {state:?} with reason {reason:?}").into())
+        }
+    }
+}
+
+fn i64_from_u64(value: u64, field: &str) -> Result<i64, Box<dyn Error>> {
+    i64::try_from(value)
+        .map_err(|_| format!("manifest {field} value {value} exceeds sqlite INTEGER range").into())
+}
+
+fn u64_from_i64(value: i64, field: &str) -> Result<u64, Box<dyn Error>> {
+    u64::try_from(value)
+        .map_err(|_| format!("manifest {field} value {value} is negative and invalid").into())
+}
+
 pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> Result<DataPaths, Box<dyn Error>> {
     let base = env::current_dir()?.join(data_dir);
     Ok(DataPaths {
         index: base.join("index"),
-        manifest: base.join("manifest.json"),
+        manifest: base.join(MANIFEST_FILE_NAME),
         base,
     })
 }
@@ -347,40 +509,69 @@ pub fn load_manifest(
         });
     }
 
-    let contents = fs::read_to_string(&data_paths.manifest)?;
-    let manifest: Manifest = match serde_json::from_str(&contents) {
-        Ok(manifest) => manifest,
+    let conn = match open_manifest_connection(&data_paths.manifest) {
+        Ok(conn) => conn,
         Err(error) => {
             return Ok(ManifestLoad {
                 manifest: empty_manifest,
-                rebuild_reason: Some(format!("manifest could not be parsed: {error}")),
+                rebuild_reason: Some(format!("manifest could not be opened: {error}")),
             });
         }
     };
 
-    if manifest.version != MANIFEST_VERSION {
+    let Some((version, manifest_root)) = (match load_manifest_info(&conn) {
+        Ok(info) => info,
+        Err(error) => {
+            return Ok(ManifestLoad {
+                manifest: empty_manifest,
+                rebuild_reason: Some(format!("manifest could not be read: {error}")),
+            });
+        }
+    }) else {
+        let existing_index = data_paths.index.join("data.mdb").exists();
+        return Ok(ManifestLoad {
+            manifest: empty_manifest,
+            rebuild_reason: existing_index.then(|| "manifest is missing".to_string()),
+        });
+    };
+
+    if version != MANIFEST_VERSION {
         return Ok(ManifestLoad {
             manifest: empty_manifest,
             rebuild_reason: Some(format!(
                 "manifest version {} does not match {}",
-                manifest.version, MANIFEST_VERSION
+                version, MANIFEST_VERSION
             )),
         });
     }
 
-    if manifest.root != root.display().to_string() {
+    let root_display = root.display().to_string();
+    if manifest_root != root_display {
         return Ok(ManifestLoad {
             manifest: empty_manifest,
             rebuild_reason: Some(format!(
                 "manifest root {} does not match {}",
-                manifest.root,
-                root.display()
+                manifest_root, root_display
             )),
         });
     }
 
+    let files = match load_manifest_files(&conn) {
+        Ok(files) => files,
+        Err(error) => {
+            return Ok(ManifestLoad {
+                manifest: empty_manifest,
+                rebuild_reason: Some(format!("manifest could not be read: {error}")),
+            });
+        }
+    };
+
     Ok(ManifestLoad {
-        manifest,
+        manifest: Manifest {
+            version,
+            root: manifest_root,
+            files,
+        },
         rebuild_reason: None,
     })
 }
@@ -448,7 +639,7 @@ pub fn scan_root(
     data_dir: &Path,
     previous: &Manifest,
     scan_hook: Option<Arc<ScanHook>>,
-    progress_manifest: Option<Arc<Mutex<Manifest>>>,
+    progress_manifest_db: Option<PathBuf>,
     error_sender: Option<mpsc::Sender<ScanError>>,
 ) -> Result<ScanOutcome, Box<dyn Error>> {
     let mut next_manifest = Manifest::new(root);
@@ -456,7 +647,10 @@ pub fn scan_root(
     let mut stats = SyncStats::default();
     let mut updates_file = NamedTempFile::new_in(data_dir)?;
     let mut writer = BufWriter::new(updates_file.as_file_mut());
-    initialize_progress_manifest(progress_manifest.as_ref(), root, previous);
+    let progress_manifest = progress_manifest_db
+        .as_deref()
+        .map(ManifestWorkingSet::open)
+        .transpose()?;
 
     let mut walker_builder = WalkBuilder::new(root);
     walker_builder
@@ -516,7 +710,7 @@ pub fn scan_root(
                         progress_manifest.as_ref(),
                         &relative_path,
                         previous_entry,
-                    );
+                    )?;
                 }
                 continue;
             }
@@ -533,7 +727,7 @@ pub fn scan_root(
                 progress_manifest.as_ref(),
                 &relative_path,
                 previous_entry,
-            );
+            )?;
             if previous_entry.is_indexed() {
                 stats.unchanged_indexed += 1;
             } else {
@@ -552,7 +746,7 @@ pub fn scan_root(
                 progress_manifest.as_ref(),
                 &mut deleted_ids,
                 &mut stats,
-            );
+            )?;
             continue;
         }
 
@@ -572,7 +766,7 @@ pub fn scan_root(
                         progress_manifest.as_ref(),
                         &relative_path,
                         previous_entry,
-                    );
+                    )?;
                 }
                 continue;
             }
@@ -588,7 +782,7 @@ pub fn scan_root(
                 progress_manifest.as_ref(),
                 &mut deleted_ids,
                 &mut stats,
-            );
+            )?;
             continue;
         }
 
@@ -604,7 +798,7 @@ pub fn scan_root(
                     progress_manifest.as_ref(),
                     &mut deleted_ids,
                     &mut stats,
-                );
+                )?;
                 continue;
             }
         };
@@ -629,7 +823,7 @@ pub fn scan_root(
         next_manifest
             .files
             .insert(relative_path.clone(), entry.clone());
-        update_progress_manifest_entry(progress_manifest.as_ref(), &relative_path, &entry);
+        update_progress_manifest_entry(progress_manifest.as_ref(), &relative_path, &entry)?;
         stats.indexed_or_updated += 1;
     }
 
@@ -643,7 +837,6 @@ pub fn scan_root(
         }
     }
 
-    replace_progress_manifest(progress_manifest.as_ref(), &next_manifest);
     if let Some(scan_hook) = scan_hook.as_ref() {
         scan_hook.clear_current_file();
     }
@@ -663,10 +856,10 @@ fn handle_unsupported_file(
     reason: SkipReason,
     previous: &Manifest,
     next_manifest: &mut Manifest,
-    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
+    progress_manifest: Option<&ManifestWorkingSet>,
     deleted_ids: &mut BTreeSet<String>,
     stats: &mut SyncStats,
-) {
+) -> Result<(), Box<dyn Error>> {
     match reason {
         SkipReason::TooLarge => stats.skipped_too_large += 1,
         SkipReason::Binary => stats.skipped_binary += 1,
@@ -685,45 +878,22 @@ fn handle_unsupported_file(
     next_manifest
         .files
         .insert(relative_path.to_string(), entry.clone());
-    update_progress_manifest_entry(progress_manifest, relative_path, &entry);
+    update_progress_manifest_entry(progress_manifest, relative_path, &entry)
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn initialize_progress_manifest(
-    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
-    root: &Path,
-    previous: &Manifest,
-) {
-    if let Some(progress_manifest) = progress_manifest {
-        let mut manifest = lock_unpoisoned(progress_manifest);
-        *manifest = previous.clone();
-        manifest.version = MANIFEST_VERSION;
-        manifest.root = root.display().to_string();
-    }
-}
-
 fn update_progress_manifest_entry(
-    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
+    progress_manifest: Option<&ManifestWorkingSet>,
     relative_path: &str,
     entry: &ManifestEntry,
-) {
+) -> Result<(), Box<dyn Error>> {
     if let Some(progress_manifest) = progress_manifest {
-        lock_unpoisoned(progress_manifest)
-            .files
-            .insert(relative_path.to_string(), entry.clone());
+        progress_manifest.update_entry(relative_path, entry)?;
     }
-}
-
-fn replace_progress_manifest(
-    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
-    manifest: &Manifest,
-) {
-    if let Some(progress_manifest) = progress_manifest {
-        *lock_unpoisoned(progress_manifest) = manifest.clone();
-    }
+    Ok(())
 }
 
 fn report_scan_error(error_sender: Option<&mpsc::Sender<ScanError>>, error: ScanError) {
@@ -833,18 +1003,37 @@ pub fn apply_index_changes(
     Ok(())
 }
 
-pub fn save_manifest(path: &Path, manifest: &Manifest) -> Result<(), Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+pub fn commit_working_manifest(path: &Path, root: &Path) -> Result<(), Box<dyn Error>> {
+    let mut conn = open_manifest_connection(path)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO manifest_info (singleton, version, root)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+             version = excluded.version,
+             root = excluded.root",
+        params![MANIFEST_VERSION, root.display().to_string()],
+    )?;
+    tx.execute("DELETE FROM manifest_files", [])?;
+    tx.execute(
+        "INSERT INTO manifest_files
+            (path, size, modified_secs, modified_nanos, state, skip_reason)
+         SELECT path, size, modified_secs, modified_nanos, state, skip_reason
+         FROM working_manifest_files",
+        [],
+    )?;
+    tx.execute("DELETE FROM working_manifest_files", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn discard_working_manifest(path: &Path) -> Result<(), Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(());
     }
 
-    let mut file = NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    serde_json::to_writer_pretty(file.as_file_mut(), manifest)?;
-    file.as_file_mut().write_all(b"\n")?;
-    file.as_file_mut().sync_all()?;
-    file.persist(path)?;
-
-    Ok(())
+    let conn = open_manifest_connection(path)?;
+    clear_working_manifest(&conn)
 }
 
 pub fn search_index(index: &Index, query: &str, limit: usize) -> Result<(), Box<dyn Error>> {
@@ -976,5 +1165,77 @@ mod tests {
         assert!(indexed.contains("visible.txt"));
         assert!(indexed.contains(".env"));
         assert!(!indexed.contains("ignored.tmp"));
+    }
+
+    #[test]
+    fn manifest_persists_in_sqlite_without_exposing_uncommitted_working_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("root");
+        let base = temp_dir.path().join(".searchx-data");
+        let data_paths = DataPaths {
+            base: base.clone(),
+            index: base.join("index"),
+            manifest: base.join(MANIFEST_FILE_NAME),
+        };
+        fs::create_dir_all(&root).unwrap();
+
+        let expected = Manifest {
+            version: MANIFEST_VERSION,
+            root: root.display().to_string(),
+            files: BTreeMap::from([
+                (
+                    "indexed.txt".to_string(),
+                    ManifestEntry::from_fingerprint(
+                        FileFingerprint {
+                            size: 12,
+                            modified_secs: 34,
+                            modified_nanos: 56,
+                        },
+                        FileState::Indexed,
+                    ),
+                ),
+                (
+                    "too-large.bin".to_string(),
+                    ManifestEntry::from_fingerprint(
+                        FileFingerprint {
+                            size: 78,
+                            modified_secs: 90,
+                            modified_nanos: 12,
+                        },
+                        FileState::Skipped {
+                            reason: SkipReason::TooLarge,
+                        },
+                    ),
+                ),
+            ]),
+        };
+
+        let working = ManifestWorkingSet::open(&data_paths.manifest).unwrap();
+        for (path, entry) in &expected.files {
+            working.update_entry(path, entry).unwrap();
+        }
+        commit_working_manifest(&data_paths.manifest, &root).unwrap();
+
+        let loaded = load_manifest(&data_paths, &root, false).unwrap();
+        assert!(loaded.rebuild_reason.is_none());
+        assert_eq!(loaded.manifest, expected);
+
+        let stale_working = ManifestWorkingSet::open(&data_paths.manifest).unwrap();
+        let stale_entry = ManifestEntry::from_fingerprint(
+            FileFingerprint {
+                size: 1,
+                modified_secs: 2,
+                modified_nanos: 3,
+            },
+            FileState::Indexed,
+        );
+        stale_working
+            .update_entry("stale.txt", &stale_entry)
+            .unwrap();
+
+        let loaded_again = load_manifest(&data_paths, &root, false).unwrap();
+        assert_eq!(loaded_again.manifest, expected);
+
+        discard_working_manifest(&data_paths.manifest).unwrap();
     }
 }

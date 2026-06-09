@@ -1,22 +1,22 @@
 use milli::update::IndexerConfig;
 use milli::{CreateOrOpen, Index};
 use searchx::{
-    DataPaths, Manifest, ScanError, ScanHook, ScanOptions, SyncStats, apply_index_changes,
-    configure_index, data_paths, default_ignore_rules, load_manifest, new_heed_options,
-    reset_data_dir, save_manifest, scan_root, search_index,
+    DataPaths, ScanError, ScanHook, ScanOptions, SyncStats, apply_index_changes,
+    commit_working_manifest, configure_index, data_paths, default_ignore_rules,
+    discard_working_manifest, load_manifest, new_heed_options, reset_data_dir, scan_root,
+    search_index,
 };
 use std::any::Any;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const DATA_DIR_NAME: &str = ".searchx-data";
 const DEFAULT_ROOT: &str = "/Users/anaren/Documents/";
 const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn print_summary(root: &Path, data_paths: &DataPaths, stats: &SyncStats, max_file_bytes: u64) {
     println!("Indexed root: {}", root.display());
@@ -41,26 +41,15 @@ fn print_summary(root: &Path, data_paths: &DataPaths, stats: &SyncStats, max_fil
     println!("Walk errors: {}", stats.walk_errors);
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
 fn drain_scan_errors(error_rx: &mpsc::Receiver<ScanError>) {
     while let Ok(error) = error_rx.try_recv() {
         eprintln!("{error}");
     }
 }
 
-fn save_progress_manifest(path: &Path, progress_manifest: &Arc<Mutex<Manifest>>) {
-    let snapshot = lock_unpoisoned(progress_manifest).clone();
-    if let Err(error) = save_manifest(path, &snapshot) {
-        eprintln!("manifest save error: {error}");
-    }
-}
-
-fn restore_manifest(path: &Path, manifest: &Manifest) {
-    if let Err(error) = save_manifest(path, manifest) {
-        eprintln!("manifest restore error: {error}");
+fn discard_working_manifest_logged(path: &Path, context: &str) {
+    if let Err(error) = discard_working_manifest(path) {
+        eprintln!("manifest cleanup error after {context}: {error}");
     }
 }
 
@@ -106,14 +95,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     configure_index(&index, &indexer_config)?;
 
     let scan_hook = Arc::new(ScanHook::new());
-    let progress_manifest = Arc::new(Mutex::new(manifest_load.manifest.clone()));
     let (error_tx, error_rx) = mpsc::channel();
     let scan_options = options.clone();
     let scan_root_path = root.clone();
     let scan_data_dir = data_paths.base.clone();
+    let scan_manifest_path = data_paths.manifest.clone();
     let previous_manifest = manifest_load.manifest.clone();
     let scan_hook_for_thread = scan_hook.clone();
-    let progress_manifest_for_thread = progress_manifest.clone();
 
     let scan_handle = thread::spawn(move || {
         scan_root(
@@ -122,14 +110,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             &scan_data_dir,
             &previous_manifest,
             Some(scan_hook_for_thread),
-            Some(progress_manifest_for_thread),
+            Some(scan_manifest_path),
             Some(error_tx),
         )
         .map_err(|error| error.to_string())
     });
 
     let mut last_reported_file = None;
-    let mut last_manifest_save = Instant::now();
 
     while !scan_handle.is_finished() {
         drain_scan_errors(&error_rx);
@@ -142,11 +129,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             last_reported_file = current_file;
         }
 
-        if last_manifest_save.elapsed() >= PROGRESS_SAVE_INTERVAL {
-            save_progress_manifest(&data_paths.manifest, &progress_manifest);
-            last_manifest_save = Instant::now();
-        }
-
         thread::sleep(PROGRESS_POLL_INTERVAL);
     }
 
@@ -154,12 +136,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         Ok(Ok(scan)) => scan,
         Ok(Err(error)) => {
             drain_scan_errors(&error_rx);
-            restore_manifest(&data_paths.manifest, &manifest_load.manifest);
+            discard_working_manifest_logged(&data_paths.manifest, "scan failure");
             return Err(error.into());
         }
         Err(payload) => {
             drain_scan_errors(&error_rx);
-            restore_manifest(&data_paths.manifest, &manifest_load.manifest);
+            discard_working_manifest_logged(&data_paths.manifest, "scan panic");
             return Err(format!("scan thread panicked: {}", panic_message(payload)).into());
         }
     };
@@ -174,12 +156,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             scan.updated_count,
             &scan.deleted_ids,
         ) {
-            restore_manifest(&data_paths.manifest, &manifest_load.manifest);
+            discard_working_manifest_logged(&data_paths.manifest, "index update failure");
             return Err(error);
         }
     }
 
-    save_manifest(&data_paths.manifest, &scan.next_manifest)?;
+    if let Err(error) = commit_working_manifest(&data_paths.manifest, &root) {
+        discard_working_manifest_logged(&data_paths.manifest, "manifest commit failure");
+        return Err(error);
+    }
 
     print_summary(&root, &data_paths, &scan.stats, options.max_file_bytes);
 
