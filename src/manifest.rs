@@ -27,7 +27,9 @@ pub(crate) struct ManifestEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileState {
     Indexed,
+    IndexedPendingEmbedding,
     IndexedMetadata { reason: SkipReason },
+    IndexedMetadataPendingEmbedding { reason: SkipReason },
     Skipped { reason: SkipReason },
 }
 
@@ -78,14 +80,26 @@ impl ManifestEntry {
     pub(crate) fn is_indexed(&self) -> bool {
         matches!(
             self.state,
-            FileState::Indexed | FileState::IndexedMetadata { .. }
+            FileState::Indexed
+                | FileState::IndexedPendingEmbedding
+                | FileState::IndexedMetadata { .. }
+                | FileState::IndexedMetadataPendingEmbedding { .. }
         )
     }
 
     pub(crate) fn skips_contents(&self) -> bool {
         matches!(
             self.state,
-            FileState::IndexedMetadata { .. } | FileState::Skipped { .. }
+            FileState::IndexedMetadata { .. }
+                | FileState::IndexedMetadataPendingEmbedding { .. }
+                | FileState::Skipped { .. }
+        )
+    }
+
+    pub(crate) fn embedding_pending(&self) -> bool {
+        matches!(
+            self.state,
+            FileState::IndexedPendingEmbedding | FileState::IndexedMetadataPendingEmbedding { .. }
         )
     }
 }
@@ -315,12 +329,19 @@ pub(crate) fn load_working_manifest(
 fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
     match state {
         FileState::Indexed => ("indexed", None),
+        FileState::IndexedPendingEmbedding => ("indexed_pending_embedding", None),
         FileState::IndexedMetadata {
             reason: SkipReason::TooLarge,
         } => ("indexed", Some("too_large")),
         FileState::IndexedMetadata {
             reason: SkipReason::Binary,
         } => ("indexed", Some("binary")),
+        FileState::IndexedMetadataPendingEmbedding {
+            reason: SkipReason::TooLarge,
+        } => ("indexed_pending_embedding", Some("too_large")),
+        FileState::IndexedMetadataPendingEmbedding {
+            reason: SkipReason::Binary,
+        } => ("indexed_pending_embedding", Some("binary")),
         FileState::Skipped {
             reason: SkipReason::TooLarge,
         } => ("skipped", Some("too_large")),
@@ -333,12 +354,23 @@ fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
 fn file_state_from_db(state: &str, skip_reason: Option<&str>) -> SearchxResult<FileState> {
     match (state, skip_reason) {
         ("indexed", None) => Ok(FileState::Indexed),
+        ("indexed_pending_embedding", None) => Ok(FileState::IndexedPendingEmbedding),
         ("indexed", Some("too_large")) => Ok(FileState::IndexedMetadata {
             reason: SkipReason::TooLarge,
         }),
         ("indexed", Some("binary")) => Ok(FileState::IndexedMetadata {
             reason: SkipReason::Binary,
         }),
+        ("indexed_pending_embedding", Some("too_large")) => {
+            Ok(FileState::IndexedMetadataPendingEmbedding {
+                reason: SkipReason::TooLarge,
+            })
+        }
+        ("indexed_pending_embedding", Some("binary")) => {
+            Ok(FileState::IndexedMetadataPendingEmbedding {
+                reason: SkipReason::Binary,
+            })
+        }
         ("skipped", Some("too_large")) => Ok(FileState::Skipped {
             reason: SkipReason::TooLarge,
         }),

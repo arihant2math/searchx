@@ -3,27 +3,29 @@ use crate::constants::{
     DEFAULT_MAP_SIZE_BYTES, PRIMARY_KEY, SEARCHABLE_FIELDS, VECTOR_DIMENSIONS,
     VECTOR_EMBEDDER_NAME, VECTOR_STORE_BACKEND,
 };
-use crate::embedding::EmbeddingInput;
+use crate::embedding::{Embedder, EmbeddingInput, OwnedEmbeddingInput};
 use crate::error::SearchxResult;
 use bumpalo::Bump;
 use http_client::policy::IpPolicy;
 use memmap2::Mmap;
 use milli::heed::{EnvOpenOptions, WithoutTls};
+use milli::index::EmbeddingsWithMetadata;
 use milli::progress::{EmbedderStats, Progress};
 use milli::update::new::indexer;
 use milli::update::{IndexerConfig, MissingDocumentPolicy, Setting, Settings};
+use milli::vector::parsed_vectors::ExplicitVectors;
 use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
-use milli::{Index, all_obkv_to_json};
+use milli::{Index, obkv_to_json};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::NamedTempFile;
 
 pub(crate) type IndexedVectors = BTreeMap<String, Option<Vec<f32>>>;
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub(crate) struct IndexedDocument {
     pub(crate) id: String,
     pub(crate) path: String,
@@ -67,25 +69,41 @@ pub fn configure_index(index: &Index, indexer_config: &IndexerConfig) -> Searchx
     Ok(())
 }
 
+fn indexed_vectors(vector: Option<Vec<f32>>) -> IndexedVectors {
+    let mut vectors = BTreeMap::new();
+    vectors.insert(VECTOR_EMBEDDER_NAME.to_string(), vector);
+    vectors
+}
+
+#[must_use]
+pub(crate) fn empty_document_vectors() -> IndexedVectors {
+    indexed_vectors(None)
+}
+
+#[must_use]
+pub(crate) fn embedded_document_vectors(vector: Vec<f32>) -> IndexedVectors {
+    indexed_vectors(Some(vector))
+}
+
 #[must_use]
 pub fn generate_document_vector(input: EmbeddingInput<'_>) -> Option<Vec<f32>> {
-    match input {
-        EmbeddingInput::Text(_text) => None,
-        EmbeddingInput::Image(_bytes) => None,
-        EmbeddingInput::Pdf(_bytes) => None,
-    }
+    let input = OwnedEmbeddingInput::from_borrowed(input)?;
+    static EMBEDDER: OnceLock<Mutex<Embedder>> = OnceLock::new();
+    let embedder = EMBEDDER.get_or_init(|| Mutex::new(Embedder::default()));
+
+    embedder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .embed(&input)
+        .ok()
 }
 
 /// Get all vectors for a document, keyed by embedder name.
 ///
 /// Currently only supports one embedder, but this should be configurable.
+#[allow(dead_code)]
 pub(crate) fn document_vectors(input: EmbeddingInput<'_>) -> IndexedVectors {
-    let mut vectors = BTreeMap::new();
-    vectors.insert(
-        VECTOR_EMBEDDER_NAME.to_string(),
-        generate_document_vector(input),
-    );
-    vectors
+    indexed_vectors(generate_document_vector(input))
 }
 
 pub(crate) fn document_id_for_path(relative_path: &str) -> String {
@@ -190,14 +208,37 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<S
     let result = search.execute()?;
     let candidate_count = result.candidates.len();
     let fields_ids_map = index.fields_ids_map(&rtxn)?;
+    let all_fields = fields_ids_map.iter().map(|(id, _)| id).collect::<Vec<_>>();
     let mut hits = Vec::new();
 
-    for (rank, (_docid, obkv)) in index
+    for (rank, (docid, obkv)) in index
         .documents(&rtxn, result.documents_ids)?
         .into_iter()
         .enumerate()
     {
-        let document = all_obkv_to_json(obkv, &fields_ids_map)?;
+        let mut document = obkv_to_json(&all_fields, &fields_ids_map, obkv)?;
+        let mut vectors = match document.remove("_vectors") {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+
+        for (
+            name,
+            EmbeddingsWithMetadata {
+                embeddings,
+                regenerate,
+                has_fragments: _,
+            },
+        ) in index.embeddings(&rtxn, docid)?
+        {
+            let explicit_vectors = ExplicitVectors {
+                embeddings: Some(embeddings.into()),
+                regenerate,
+            };
+            vectors.insert(name, serde_json::to_value(explicit_vectors)?);
+        }
+        document.insert("_vectors".into(), serde_json::Value::Object(vectors));
+
         let path = document
             .get("path")
             .and_then(|value| value.as_str())

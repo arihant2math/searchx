@@ -44,6 +44,10 @@ pub enum SearchxError {
     IndexingPipelineDisconnected,
     #[error("scan thread panicked: {message}")]
     ScanThreadPanicked { message: String },
+    #[error("embedding thread panicked: {message}")]
+    EmbeddingThreadPanicked { message: String },
+    #[error("embedding failed: {message}")]
+    Embedding { message: String },
 }
 
 impl From<milli::Error> for SearchxError {

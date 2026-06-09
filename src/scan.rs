@@ -1,7 +1,7 @@
 use crate::api::{ScanError, ScanHook, ScanOptions, SyncStats};
-use crate::embedding::EmbeddingInput;
+use crate::embedding::OwnedEmbeddingInput;
 use crate::error::{SearchxError, SearchxResult};
-use crate::index::{IndexedDocument, document_id_for_path, document_vectors};
+use crate::index::{IndexedDocument, document_id_for_path, empty_document_vectors};
 use crate::manifest::{FileFingerprint, FileState, Manifest, ManifestEntry, SkipReason};
 use ignore::{DirEntry, WalkBuilder};
 use std::collections::HashSet;
@@ -22,8 +22,9 @@ pub(crate) struct ProgressUpdate {
 #[derive(Debug)]
 pub(crate) enum IndexEvent {
     Upsert {
+        document_id: String,
         document: String,
-        progress: ProgressUpdate,
+        progress: Option<ProgressUpdate>,
     },
     Delete {
         document_id: String,
@@ -33,9 +34,17 @@ pub(crate) enum IndexEvent {
 }
 
 #[derive(Debug)]
+pub(crate) struct EmbeddingJob {
+    pub(crate) document: IndexedDocument,
+    pub(crate) input: OwnedEmbeddingInput,
+    pub(crate) progress: ProgressUpdate,
+}
+
+#[derive(Debug)]
 pub(crate) struct ScanPipeline {
     pub(crate) error_sender: Option<mpsc::Sender<ScanError>>,
     pub(crate) event_sender: mpsc::SyncSender<IndexEvent>,
+    pub(crate) embedding_sender: Option<mpsc::SyncSender<EmbeddingJob>>,
     pub(crate) cancel_flag: Arc<AtomicBool>,
 }
 
@@ -57,6 +66,7 @@ struct ScanContext<'a> {
     scan_hook: Option<&'a ScanHook>,
     error_sender: Option<&'a mpsc::Sender<ScanError>>,
     event_sender: &'a mpsc::SyncSender<IndexEvent>,
+    embedding_sender: Option<&'a mpsc::SyncSender<EmbeddingJob>>,
     cancel_flag: &'a AtomicBool,
     seen_paths: HashSet<String>,
     stats: SyncStats,
@@ -77,6 +87,7 @@ impl<'a> ScanContext<'a> {
             scan_hook,
             error_sender: pipeline.error_sender.as_ref(),
             event_sender: &pipeline.event_sender,
+            embedding_sender: pipeline.embedding_sender.as_ref(),
             cancel_flag: pipeline.cancel_flag.as_ref(),
             seen_paths: HashSet::with_capacity(previous.files.len().saturating_mul(2)),
             stats: SyncStats::default(),
@@ -156,6 +167,7 @@ impl<'a> ScanContext<'a> {
         let fingerprint = FileFingerprint::from_metadata(&metadata);
         if let Some(previous_entry) = self.previous.files.get(&relative_path).cloned()
             && previous_entry.matches(fingerprint)
+            && !previous_entry.embedding_pending()
         {
             self.mark_unchanged(&relative_path, &previous_entry)?;
             return Ok(());
@@ -175,8 +187,10 @@ impl<'a> ScanContext<'a> {
             return Ok(());
         };
 
-        if let Some(vector_input) = supported_binary_embedding_input(path, &bytes) {
-            return self.index_binary_document(&relative_path, path, fingerprint, vector_input);
+        if let Some(embedding_input) =
+            supported_binary_embedding_input(&relative_path, path, &bytes)
+        {
+            return self.index_binary_document(&relative_path, path, fingerprint, embedding_input);
         }
 
         if bytes.contains(&0) {
@@ -281,14 +295,16 @@ impl<'a> ScanContext<'a> {
             SkipReason::Binary => self.stats.skipped_binary += 1,
         }
 
-        let embedding_text = metadata_embedding_text(relative_path, path);
         self.upsert_document(
             relative_path,
             path,
             fingerprint,
             FileState::IndexedMetadata { reason },
             String::new(),
-            EmbeddingInput::Text(embedding_text.as_str()),
+            Some(OwnedEmbeddingInput::Text(metadata_embedding_text(
+                relative_path,
+                path,
+            ))),
         )
     }
 
@@ -297,7 +313,7 @@ impl<'a> ScanContext<'a> {
         relative_path: &str,
         path: &Path,
         fingerprint: FileFingerprint,
-        vector_input: EmbeddingInput<'_>,
+        embedding_input: OwnedEmbeddingInput,
     ) -> SearchxResult<()> {
         self.upsert_document(
             relative_path,
@@ -305,7 +321,7 @@ impl<'a> ScanContext<'a> {
             fingerprint,
             FileState::Indexed,
             String::new(),
-            vector_input,
+            Some(embedding_input),
         )
     }
 
@@ -322,7 +338,7 @@ impl<'a> ScanContext<'a> {
             fingerprint,
             FileState::Indexed,
             contents.clone(),
-            EmbeddingInput::Text(contents.as_str()),
+            Some(OwnedEmbeddingInput::Text(contents.clone())),
         )
     }
 
@@ -331,11 +347,16 @@ impl<'a> ScanContext<'a> {
         relative_path: &str,
         path: &Path,
         fingerprint: FileFingerprint,
-        state: FileState,
+        final_state: FileState,
         contents: String,
-        vector_input: EmbeddingInput<'_>,
+        embedding_input: Option<OwnedEmbeddingInput>,
     ) -> SearchxResult<()> {
-        let vectors = document_vectors(vector_input);
+        let initial_state = if embedding_input.is_some() && self.embedding_sender.is_some() {
+            pending_embedding_state(&final_state)
+        } else {
+            final_state.clone()
+        };
+
         let document = IndexedDocument {
             id: document_id_for_path(relative_path),
             path: relative_path.to_string(),
@@ -346,20 +367,38 @@ impl<'a> ScanContext<'a> {
                 .to_string(),
             extension: path.extension().and_then(OsStr::to_str).map(str::to_string),
             contents,
-            vectors,
+            vectors: empty_document_vectors(),
         };
-        let entry = ManifestEntry::from_fingerprint(fingerprint, state);
+        let document_id = document.id.clone();
+
         send_index_event(
             self.event_sender,
             self.cancel_flag,
             IndexEvent::Upsert {
+                document_id,
                 document: serde_json::to_string(&document)?,
-                progress: ProgressUpdate {
+                progress: Some(ProgressUpdate {
                     path: relative_path.to_string(),
-                    entry,
-                },
+                    entry: ManifestEntry::from_fingerprint(fingerprint, initial_state),
+                }),
             },
         )?;
+
+        if let (Some(embedding_sender), Some(input)) = (self.embedding_sender, embedding_input) {
+            send_embedding_job(
+                embedding_sender,
+                self.cancel_flag,
+                EmbeddingJob {
+                    document,
+                    input,
+                    progress: ProgressUpdate {
+                        path: relative_path.to_string(),
+                        entry: ManifestEntry::from_fingerprint(fingerprint, final_state),
+                    },
+                },
+            )?;
+        }
+
         self.stats.indexed_or_updated += 1;
         Ok(())
     }
@@ -416,6 +455,20 @@ fn send_progress_event(
     )
 }
 
+fn send_embedding_job(
+    embedding_sender: &mpsc::SyncSender<EmbeddingJob>,
+    cancel_flag: &AtomicBool,
+    job: EmbeddingJob,
+) -> SearchxResult<()> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(SearchxError::IndexingCanceled);
+    }
+
+    embedding_sender
+        .send(job)
+        .map_err(|_| SearchxError::IndexingPipelineDisconnected)
+}
+
 fn report_scan_error(error_sender: Option<&mpsc::Sender<ScanError>>, error: ScanError) {
     if let Some(error_sender) = error_sender {
         let _ = error_sender.send(error);
@@ -441,6 +494,20 @@ fn build_ignore_file(
     Ok(Some(file))
 }
 
+fn pending_embedding_state(state: &FileState) -> FileState {
+    match state {
+        FileState::Indexed => FileState::IndexedPendingEmbedding,
+        FileState::IndexedPendingEmbedding => FileState::IndexedPendingEmbedding,
+        FileState::IndexedMetadata { reason } => {
+            FileState::IndexedMetadataPendingEmbedding { reason: *reason }
+        }
+        FileState::IndexedMetadataPendingEmbedding { reason } => {
+            FileState::IndexedMetadataPendingEmbedding { reason: *reason }
+        }
+        FileState::Skipped { reason } => FileState::Skipped { reason: *reason },
+    }
+}
+
 fn metadata_embedding_text(relative_path: &str, path: &Path) -> String {
     let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
     let extension = path.extension().and_then(OsStr::to_str).unwrap_or_default();
@@ -452,21 +519,25 @@ fn metadata_embedding_text(relative_path: &str, path: &Path) -> String {
     }
 }
 
-fn supported_binary_embedding_input<'a>(
+fn supported_binary_embedding_input(
+    relative_path: &str,
     path: &Path,
-    bytes: &'a [u8],
-) -> Option<EmbeddingInput<'a>> {
+    bytes: &[u8],
+) -> Option<OwnedEmbeddingInput> {
     let extension = path.extension().and_then(OsStr::to_str)?;
 
     if extension.eq_ignore_ascii_case("pdf") {
-        return Some(EmbeddingInput::Pdf(bytes));
+        return Some(OwnedEmbeddingInput::Text(metadata_embedding_text(
+            relative_path,
+            path,
+        )));
     }
 
     if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"]
         .iter()
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
     {
-        return Some(EmbeddingInput::Image(bytes));
+        return Some(OwnedEmbeddingInput::Image(bytes.to_vec()));
     }
 
     None

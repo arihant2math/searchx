@@ -2,21 +2,25 @@ use crate::api::{
     ManifestLoad, ScanHook, ScanOptions, SyncIndexResult, SyncProgress, SyncRequest, SyncStats,
 };
 use crate::constants::{
-    INDEX_BATCH_BYTE_LIMIT, INDEX_BATCH_DELETE_LIMIT, INDEX_BATCH_DOC_LIMIT,
-    INDEX_EVENT_CHANNEL_CAPACITY, MANIFEST_BATCH_ENTRY_LIMIT, PROGRESS_POLL_INTERVAL,
+    EMBEDDING_JOB_CHANNEL_CAPACITY, INDEX_BATCH_BYTE_LIMIT, INDEX_BATCH_DELETE_LIMIT,
+    INDEX_BATCH_DOC_LIMIT, INDEX_EVENT_CHANNEL_CAPACITY, MANIFEST_BATCH_ENTRY_LIMIT,
+    PROGRESS_POLL_INTERVAL,
 };
 use crate::error::{SearchxError, SearchxResult};
-use crate::index::{apply_index_batch, configure_index, document_id_for_path, new_heed_options};
+use crate::index::{
+    apply_index_batch, configure_index, document_id_for_path, embedded_document_vectors,
+    new_heed_options,
+};
 use crate::manifest::{
     Manifest, ManifestWorkingSet, clear_index_incomplete, commit_working_manifest, data_paths,
     load_manifest, load_working_manifest, mark_index_incomplete, open_manifest_connection,
     reset_data_dir,
 };
-use crate::scan::{IndexEvent, ProgressUpdate, ScanPipeline, scan_root};
+use crate::scan::{EmbeddingJob, IndexEvent, ProgressUpdate, ScanPipeline, scan_root};
 use milli::update::IndexerConfig;
 use milli::{Index, all_obkv_to_json};
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +29,8 @@ use std::thread;
 
 #[derive(Default)]
 struct PendingIndexBatch {
-    upserts: Vec<String>,
-    deleted_ids: Vec<String>,
+    upserts: BTreeMap<String, String>,
+    deleted_ids: BTreeSet<String>,
     progress_updates: Vec<ProgressUpdate>,
     bytes: usize,
 }
@@ -34,16 +38,28 @@ struct PendingIndexBatch {
 impl PendingIndexBatch {
     fn push(&mut self, event: IndexEvent) {
         match event {
-            IndexEvent::Upsert { document, progress } => {
+            IndexEvent::Upsert {
+                document_id,
+                document,
+                progress,
+            } => {
+                if let Some(previous) = self.upserts.insert(document_id.clone(), document.clone()) {
+                    self.bytes = self.bytes.saturating_sub(previous.len());
+                }
                 self.bytes += document.len();
-                self.upserts.push(document);
-                self.progress_updates.push(progress);
+                self.deleted_ids.remove(&document_id);
+                if let Some(progress) = progress {
+                    self.progress_updates.push(progress);
+                }
             }
             IndexEvent::Delete {
                 document_id,
                 progress,
             } => {
-                self.deleted_ids.push(document_id);
+                if let Some(previous) = self.upserts.remove(&document_id) {
+                    self.bytes = self.bytes.saturating_sub(previous.len());
+                }
+                self.deleted_ids.insert(document_id);
                 if let Some(progress) = progress {
                     self.progress_updates.push(progress);
                 }
@@ -74,12 +90,14 @@ impl PendingIndexBatch {
         }
 
         if !self.upserts.is_empty() || !self.deleted_ids.is_empty() {
+            let upserts = self.upserts.values().cloned().collect::<Vec<_>>();
+            let deleted_ids = self.deleted_ids.iter().cloned().collect::<Vec<_>>();
             apply_index_batch(
                 index,
                 indexer_config,
                 &data_paths.base,
-                &self.upserts,
-                &self.deleted_ids,
+                &upserts,
+                &deleted_ids,
             )?;
         }
 
@@ -142,14 +160,6 @@ fn report_sync_progress<F>(
     }
 }
 
-fn cancel_scan_thread(
-    scan_handle: thread::JoinHandle<SearchxResult<SyncStats>>,
-    cancel_flag: &AtomicBool,
-) {
-    cancel_flag.store(true, Ordering::Relaxed);
-    let _ = scan_handle.join();
-}
-
 fn finish_scan_thread(
     scan_handle: thread::JoinHandle<SearchxResult<SyncStats>>,
 ) -> SearchxResult<SyncStats> {
@@ -158,6 +168,53 @@ fn finish_scan_thread(
         Err(payload) => Err(SearchxError::ScanThreadPanicked {
             message: panic_message(payload.as_ref()),
         }),
+    }
+}
+
+fn finish_embedding_thread(
+    embedding_handle: thread::JoinHandle<SearchxResult<()>>,
+) -> SearchxResult<()> {
+    match embedding_handle.join() {
+        Ok(result) => result,
+        Err(payload) => Err(SearchxError::EmbeddingThreadPanicked {
+            message: panic_message(payload.as_ref()),
+        }),
+    }
+}
+
+fn run_embedding_thread(
+    job_rx: mpsc::Receiver<EmbeddingJob>,
+    event_tx: mpsc::SyncSender<IndexEvent>,
+    cancel_flag: Arc<AtomicBool>,
+) -> SearchxResult<()> {
+    let mut embedder = crate::embedding::Embedder::default();
+
+    loop {
+        match job_rx.recv_timeout(PROGRESS_POLL_INTERVAL) {
+            Ok(job) => match embedder.embed(&job.input) {
+                Ok(vector) => {
+                    let mut document = job.document;
+                    let document_id = document.id.clone();
+                    document.vectors = embedded_document_vectors(vector);
+                    event_tx
+                        .send(IndexEvent::Upsert {
+                            document_id,
+                            document: serde_json::to_string(&document)?,
+                            progress: Some(job.progress),
+                        })
+                        .map_err(|_| SearchxError::IndexingPipelineDisconnected)?;
+                }
+                Err(error) => {
+                    eprintln!("embedding error for {}: {}", job.progress.path, error);
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
     }
 }
 
@@ -233,18 +290,30 @@ where
     let progress_manifest =
         ManifestWorkingSet::open(&data_paths.manifest, root, resume_existing_progress)?;
     let (event_tx, event_rx) = mpsc::sync_channel(INDEX_EVENT_CHANNEL_CAPACITY);
+    let (embedding_job_tx, embedding_job_rx) = mpsc::sync_channel(EMBEDDING_JOB_CHANNEL_CAPACITY);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let scan_options = options.clone();
     let scan_root_path = root.to_path_buf();
     let scan_data_dir = data_paths.base.clone();
     let scan_hook_for_thread = Arc::clone(scan_hook);
     let cancel_flag_for_thread = Arc::clone(&cancel_flag);
+    let cancel_flag_for_embedding = Arc::clone(&cancel_flag);
+    let embedding_event_tx = event_tx.clone();
     let (scan_error_tx, scan_error_rx) = mpsc::channel();
+
+    let embedding_handle = thread::spawn(move || {
+        run_embedding_thread(
+            embedding_job_rx,
+            embedding_event_tx,
+            cancel_flag_for_embedding,
+        )
+    });
 
     let scan_handle = thread::spawn(move || {
         let pipeline = ScanPipeline {
             error_sender: Some(scan_error_tx),
             event_sender: event_tx,
+            embedding_sender: Some(embedding_job_tx),
             cancel_flag: cancel_flag_for_thread,
         };
 
@@ -276,8 +345,10 @@ where
                         data_paths,
                     )
                 {
+                    cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
-                    cancel_scan_thread(scan_handle, &cancel_flag);
+                    let _ = finish_scan_thread(scan_handle);
+                    let _ = finish_embedding_thread(embedding_handle);
                     return Err(error);
                 }
             }
@@ -285,13 +356,21 @@ where
                 if let Err(error) =
                     pending_batch.flush(index, indexer_config, Some(&progress_manifest), data_paths)
                 {
+                    cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
-                    cancel_scan_thread(scan_handle, &cancel_flag);
+                    let _ = finish_scan_thread(scan_handle);
+                    let _ = finish_embedding_thread(embedding_handle);
                     return Err(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break finish_scan_thread(scan_handle)?;
+                let scan_result = finish_scan_thread(scan_handle);
+                let embedding_result = finish_embedding_thread(embedding_handle);
+                break match (scan_result, embedding_result) {
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                    (Ok(stats), Ok(())) => Ok(stats),
+                }?;
             }
         }
     };

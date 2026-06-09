@@ -35,6 +35,7 @@ fn streamed_indexed_paths(options: &ScanOptions, root: &Path, data_dir: &Path) -
         &ScanPipeline {
             error_sender: None,
             event_sender: event_tx,
+            embedding_sender: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         },
     )
@@ -315,6 +316,13 @@ fn sync_repairs_orphaned_documents_after_incomplete_run() {
     let live_results = search_index(&result.index, "live", 10).unwrap();
     assert_eq!(live_results.candidate_count, 1);
     assert_eq!(live_results.hits[0].path, "live.txt");
+    assert_eq!(
+        live_results.hits[0].document["_vectors"][VECTOR_EMBEDDER_NAME]["embeddings"][0]
+            .as_array()
+            .unwrap()
+            .len(),
+        VECTOR_DIMENSIONS
+    );
 }
 
 #[test]
@@ -346,6 +354,13 @@ fn sync_indexes_supported_images_without_marking_them_as_skipped_binary() {
     assert_eq!(image_results.candidate_count, 1);
     assert_eq!(image_results.hits[0].path, "pixel.gif");
     assert_eq!(image_results.hits[0].document["contents"], "");
+    assert_eq!(
+        image_results.hits[0].document["_vectors"][VECTOR_EMBEDDER_NAME]["embeddings"][0]
+            .as_array()
+            .unwrap()
+            .len(),
+        VECTOR_DIMENSIONS
+    );
 }
 
 #[test]
@@ -376,6 +391,13 @@ fn sync_indexes_binary_and_oversized_files_by_name() {
     assert_eq!(archive_results.candidate_count, 1);
     assert_eq!(archive_results.hits[0].path, "archive.pdf");
     assert_eq!(archive_results.hits[0].document["contents"], "");
+    assert_eq!(
+        archive_results.hits[0].document["_vectors"][VECTOR_EMBEDDER_NAME]["embeddings"][0]
+            .as_array()
+            .unwrap()
+            .len(),
+        VECTOR_DIMENSIONS
+    );
 
     let blob_results = search_index(&result.index, "blob", 10).unwrap();
     assert_eq!(blob_results.candidate_count, 1);
