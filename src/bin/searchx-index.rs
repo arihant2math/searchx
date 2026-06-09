@@ -1,8 +1,5 @@
 use clap::Parser;
-use searchx::{
-    DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, ScanOptions, SearchxResult, SyncIndexResult,
-    SyncProgress, SyncRequest, sync_index_with_progress,
-};
+use searchx::{DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, ScanOptions, SearchxResult, SyncIndexResult, SyncProgress, SyncRequest, sync_index_with_progress, default_ignore_rules};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -19,6 +16,8 @@ struct Args {
     /// Force a full rebuild before indexing
     #[arg(short = 'r', long)]
     rebuild: bool,
+    #[arg(short = 'i', long = "ignore")]
+    ignore_rules: Vec<String>,
 }
 
 fn print_summary(result: &SyncIndexResult, max_file_bytes: u64) {
@@ -53,11 +52,15 @@ fn print_summary(result: &SyncIndexResult, max_file_bytes: u64) {
 fn run() -> SearchxResult<()> {
     let args = Args::parse();
 
+    let mut ignore_rules = default_ignore_rules();
+    ignore_rules.append(&mut args.ignore_rules.clone());
+
     let request = SyncRequest::new(&args.root)
         .with_data_dir(&args.data_dir)
         .with_options(ScanOptions {
             rebuild: args.rebuild,
             max_file_bytes: args.max_file_bytes,
+            ignore_rules,
             ..ScanOptions::default()
         });
 
