@@ -92,6 +92,7 @@ const INDEX_EVENT_CHANNEL_CAPACITY: usize = 32;
 const INDEX_BATCH_DOC_LIMIT: usize = 128;
 const INDEX_BATCH_DELETE_LIMIT: usize = 512;
 const INDEX_BATCH_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+const MANIFEST_BATCH_ENTRY_LIMIT: usize = 512;
 const DEFAULT_IGNORE_RULES: &[&str] = &[
     ".git/",
     "node_modules/",
@@ -386,15 +387,27 @@ pub struct SyncStats {
     pub walk_errors: u64,
 }
 
-#[derive(Debug)]
-pub enum IndexEvent {
-    Upsert(String),
-    Delete(String),
+#[derive(Debug, Clone)]
+struct ProgressUpdate {
+    path: String,
+    entry: ManifestEntry,
 }
 
 #[derive(Debug)]
-pub struct ScanPipeline {
-    pub progress_manifest_db: Option<PathBuf>,
+enum IndexEvent {
+    Upsert {
+        document: String,
+        progress: ProgressUpdate,
+    },
+    Delete {
+        document_id: String,
+        progress: Option<ProgressUpdate>,
+    },
+    Progress(ProgressUpdate),
+}
+
+#[derive(Debug)]
+struct ScanPipeline {
     pub error_sender: Option<mpsc::Sender<ScanError>>,
     pub event_sender: mpsc::SyncSender<IndexEvent>,
     pub cancel_flag: Arc<AtomicBool>,
@@ -404,6 +417,7 @@ pub struct ScanPipeline {
 pub struct ManifestLoad {
     pub manifest: Manifest,
     pub rebuild_reason: Option<String>,
+    pub resume_from_incomplete: bool,
 }
 
 impl Manifest {
@@ -466,9 +480,14 @@ struct ManifestWorkingSet {
 }
 
 impl ManifestWorkingSet {
-    fn open(path: &Path) -> SearchxResult<Self> {
+    fn open(path: &Path, root: &Path, resume_existing: bool) -> SearchxResult<Self> {
         let conn = open_manifest_connection(path)?;
-        clear_working_manifest(&conn)?;
+        if resume_existing {
+            ensure_working_manifest_info(&conn, root)?;
+        } else {
+            clear_working_manifest(&conn)?;
+            store_working_manifest_info(&conn, root)?;
+        }
         Ok(Self { conn })
     }
 
@@ -495,6 +514,13 @@ impl ManifestWorkingSet {
         )?;
         Ok(())
     }
+
+    fn update_entries(&self, updates: &[ProgressUpdate]) -> SearchxResult<()> {
+        for update in updates {
+            self.update_entry(&update.path, &update.entry)?;
+        }
+        Ok(())
+    }
 }
 
 fn open_manifest_connection(path: &Path) -> SearchxResult<Connection> {
@@ -519,6 +545,11 @@ fn open_manifest_connection(path: &Path) -> SearchxResult<Connection> {
              state TEXT NOT NULL,
              skip_reason TEXT
          );
+         CREATE TABLE IF NOT EXISTS working_manifest_info (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             version INTEGER NOT NULL,
+             root TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS working_manifest_files (
              path TEXT PRIMARY KEY,
              size INTEGER NOT NULL,
@@ -531,27 +562,67 @@ fn open_manifest_connection(path: &Path) -> SearchxResult<Connection> {
     Ok(conn)
 }
 
-fn clear_working_manifest(conn: &Connection) -> SearchxResult<()> {
-    conn.execute("DELETE FROM working_manifest_files", [])?;
+fn store_manifest_info(conn: &Connection, table: &str, root: &Path) -> SearchxResult<()> {
+    let sql = format!(
+        "INSERT INTO {table} (singleton, version, root)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+             version = excluded.version,
+             root = excluded.root"
+    );
+    conn.execute(&sql, params![MANIFEST_VERSION, root.display().to_string()])?;
     Ok(())
 }
 
-fn load_manifest_info(conn: &Connection) -> SearchxResult<Option<(u32, String)>> {
+fn store_working_manifest_info(conn: &Connection, root: &Path) -> SearchxResult<()> {
+    store_manifest_info(conn, "working_manifest_info", root)
+}
+
+fn load_manifest_info_from_table(
+    conn: &Connection,
+    table: &str,
+) -> SearchxResult<Option<(u32, String)>> {
+    let sql = format!("SELECT version, root FROM {table} WHERE singleton = 1");
     let info = conn
-        .query_row(
-            "SELECT version, root FROM manifest_info WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
-        )
+        .query_row(&sql, [], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
         .optional()?;
     Ok(info)
 }
 
-fn load_manifest_files(conn: &Connection) -> SearchxResult<BTreeMap<String, ManifestEntry>> {
-    let mut statement = conn.prepare(
+fn clear_working_manifest(conn: &Connection) -> SearchxResult<()> {
+    conn.execute("DELETE FROM working_manifest_info", [])?;
+    conn.execute("DELETE FROM working_manifest_files", [])?;
+    Ok(())
+}
+
+fn ensure_working_manifest_info(conn: &Connection, root: &Path) -> SearchxResult<()> {
+    let root_display = root.display().to_string();
+    match load_manifest_info_from_table(conn, "working_manifest_info")? {
+        Some((version, working_root))
+            if version == MANIFEST_VERSION && working_root == root_display => {}
+        _ => {
+            clear_working_manifest(conn)?;
+            store_working_manifest_info(conn, root)?;
+        }
+    }
+    Ok(())
+}
+
+fn load_manifest_info(conn: &Connection) -> SearchxResult<Option<(u32, String)>> {
+    load_manifest_info_from_table(conn, "manifest_info")
+}
+
+fn load_manifest_files_from_table(
+    conn: &Connection,
+    table: &str,
+) -> SearchxResult<BTreeMap<String, ManifestEntry>> {
+    let sql = format!(
         "SELECT path, size, modified_secs, modified_nanos, state, skip_reason
-         FROM manifest_files",
-    )?;
+         FROM {table}"
+    );
+    let mut statement = conn.prepare(&sql)?;
     let mut rows = statement.query([])?;
     let mut files = BTreeMap::new();
 
@@ -572,6 +643,30 @@ fn load_manifest_files(conn: &Connection) -> SearchxResult<BTreeMap<String, Mani
     }
 
     Ok(files)
+}
+
+fn load_manifest_files(conn: &Connection) -> SearchxResult<BTreeMap<String, ManifestEntry>> {
+    load_manifest_files_from_table(conn, "manifest_files")
+}
+
+fn load_working_manifest(conn: &Connection, root: &Path) -> SearchxResult<Option<Manifest>> {
+    let Some((version, manifest_root)) =
+        load_manifest_info_from_table(conn, "working_manifest_info")?
+    else {
+        return Ok(None);
+    };
+
+    let root_display = root.display().to_string();
+    if version != MANIFEST_VERSION || manifest_root != root_display {
+        return Ok(None);
+    }
+
+    let files = load_manifest_files_from_table(conn, "working_manifest_files")?;
+    Ok(Some(Manifest {
+        version,
+        root: manifest_root,
+        files,
+    }))
 }
 
 fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
@@ -614,11 +709,20 @@ fn u64_from_i64(value: i64, field: &'static str) -> SearchxResult<u64> {
     u64::try_from(value).map_err(|_| SearchxError::ManifestNegativeValue { field, value })
 }
 
-fn manifest_load_with_reason(root: &Path, rebuild_reason: Option<String>) -> ManifestLoad {
+fn manifest_load(
+    manifest: Manifest,
+    rebuild_reason: Option<String>,
+    resume_from_incomplete: bool,
+) -> ManifestLoad {
     ManifestLoad {
-        manifest: Manifest::new(root),
+        manifest,
         rebuild_reason,
+        resume_from_incomplete,
     }
+}
+
+fn manifest_load_with_reason(root: &Path, rebuild_reason: Option<String>) -> ManifestLoad {
+    manifest_load(Manifest::new(root), rebuild_reason, false)
 }
 
 fn rebuild_manifest_load(root: &Path, reason: impl Into<String>) -> ManifestLoad {
@@ -632,6 +736,60 @@ fn missing_manifest_load(root: &Path, data_paths: &DataPaths) -> ManifestLoad {
         .exists()
         .then(|| "manifest is missing".to_string());
     manifest_load_with_reason(root, rebuild_reason)
+}
+
+enum StoredManifestState {
+    Ready(Manifest),
+    Missing,
+    Rebuild(String),
+}
+
+fn load_stored_manifest_state(data_paths: &DataPaths, root: &Path) -> StoredManifestState {
+    if !data_paths.manifest.exists() {
+        return StoredManifestState::Missing;
+    }
+
+    let conn = match open_manifest_connection(&data_paths.manifest) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return StoredManifestState::Rebuild(format!("manifest could not be opened: {error}"));
+        }
+    };
+
+    let Some((version, manifest_root)) = (match load_manifest_info(&conn) {
+        Ok(info) => info,
+        Err(error) => {
+            return StoredManifestState::Rebuild(format!("manifest could not be read: {error}"));
+        }
+    }) else {
+        return StoredManifestState::Missing;
+    };
+
+    if version != MANIFEST_VERSION {
+        return StoredManifestState::Rebuild(format!(
+            "manifest version {version} does not match {MANIFEST_VERSION}"
+        ));
+    }
+
+    let root_display = root.display().to_string();
+    if manifest_root != root_display {
+        return StoredManifestState::Rebuild(format!(
+            "manifest root {manifest_root} does not match {root_display}"
+        ));
+    }
+
+    let files = match load_manifest_files(&conn) {
+        Ok(files) => files,
+        Err(error) => {
+            return StoredManifestState::Rebuild(format!("manifest could not be read: {error}"));
+        }
+    };
+
+    StoredManifestState::Ready(Manifest {
+        version,
+        root: manifest_root,
+        files,
+    })
 }
 
 pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> SearchxResult<DataPaths> {
@@ -666,71 +824,55 @@ pub fn load_manifest(
         return Ok(rebuild_manifest_load(root, "forced by --rebuild"));
     }
 
+    let stored_state = load_stored_manifest_state(data_paths, root);
+
     if data_paths.incomplete_marker.exists() {
-        return Ok(rebuild_manifest_load(
-            root,
-            "previous indexing run did not complete cleanly",
-        ));
-    }
-
-    if !data_paths.manifest.exists() {
-        return Ok(missing_manifest_load(root, data_paths));
-    }
-
-    let conn = match open_manifest_connection(&data_paths.manifest) {
-        Ok(conn) => conn,
-        Err(error) => {
-            return Ok(rebuild_manifest_load(
-                root,
-                format!("manifest could not be opened: {error}"),
-            ));
+        match &stored_state {
+            StoredManifestState::Rebuild(reason) => {
+                return Ok(rebuild_manifest_load(root, reason.clone()));
+            }
+            StoredManifestState::Ready(_) | StoredManifestState::Missing => {}
         }
-    };
 
-    let Some((version, manifest_root)) = (match load_manifest_info(&conn) {
-        Ok(info) => info,
-        Err(error) => {
-            return Ok(rebuild_manifest_load(
-                root,
-                format!("manifest could not be read: {error}"),
-            ));
+        if data_paths.manifest.exists() {
+            let conn = match open_manifest_connection(&data_paths.manifest) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    return Ok(rebuild_manifest_load(
+                        root,
+                        format!("manifest could not be opened: {error}"),
+                    ));
+                }
+            };
+
+            let working_manifest = match load_working_manifest(&conn, root) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return Ok(rebuild_manifest_load(
+                        root,
+                        format!("working manifest could not be read: {error}"),
+                    ));
+                }
+            };
+
+            if let Some(working_manifest) = working_manifest {
+                let manifest = match stored_state {
+                    StoredManifestState::Ready(mut manifest) => {
+                        manifest.files.extend(working_manifest.files);
+                        manifest
+                    }
+                    StoredManifestState::Missing => working_manifest,
+                    StoredManifestState::Rebuild(_) => unreachable!(),
+                };
+                return Ok(manifest_load(manifest, None, true));
+            }
         }
-    }) else {
-        return Ok(missing_manifest_load(root, data_paths));
-    };
-
-    if version != MANIFEST_VERSION {
-        return Ok(rebuild_manifest_load(
-            root,
-            format!("manifest version {version} does not match {MANIFEST_VERSION}"),
-        ));
     }
 
-    let root_display = root.display().to_string();
-    if manifest_root != root_display {
-        return Ok(rebuild_manifest_load(
-            root,
-            format!("manifest root {manifest_root} does not match {root_display}"),
-        ));
-    }
-
-    let files = match load_manifest_files(&conn) {
-        Ok(files) => files,
-        Err(error) => {
-            return Ok(rebuild_manifest_load(
-                root,
-                format!("manifest could not be read: {error}"),
-            ));
-        }
-    };
-
-    Ok(ManifestLoad {
-        manifest: Manifest {
-            version,
-            root: manifest_root,
-            files,
-        },
-        rebuild_reason: None,
+    Ok(match stored_state {
+        StoredManifestState::Ready(manifest) => manifest_load(manifest, None, false),
+        StoredManifestState::Missing => missing_manifest_load(root, data_paths),
+        StoredManifestState::Rebuild(reason) => rebuild_manifest_load(root, reason),
     })
 }
 
@@ -789,7 +931,7 @@ fn document_vectors(relative_path: &str, contents: &str) -> IndexedVectors {
     vectors
 }
 
-pub fn scan_root(
+fn scan_root(
     options: &ScanOptions,
     root: &Path,
     data_dir: &Path,
@@ -808,7 +950,6 @@ struct ScanContext<'a> {
     error_sender: Option<&'a mpsc::Sender<ScanError>>,
     event_sender: &'a mpsc::SyncSender<IndexEvent>,
     cancel_flag: &'a AtomicBool,
-    progress_manifest: Option<ManifestWorkingSet>,
     seen_paths: HashSet<String>,
     stats: SyncStats,
 }
@@ -821,12 +962,6 @@ impl<'a> ScanContext<'a> {
         scan_hook: Option<&'a ScanHook>,
         pipeline: &'a ScanPipeline,
     ) -> SearchxResult<Self> {
-        let progress_manifest = pipeline
-            .progress_manifest_db
-            .as_deref()
-            .map(ManifestWorkingSet::open)
-            .transpose()?;
-
         Ok(Self {
             options,
             root,
@@ -835,7 +970,6 @@ impl<'a> ScanContext<'a> {
             error_sender: pipeline.error_sender.as_ref(),
             event_sender: &pipeline.event_sender,
             cancel_flag: pipeline.cancel_flag.as_ref(),
-            progress_manifest,
             seen_paths: HashSet::with_capacity(previous.files.len().saturating_mul(2)),
             stats: SyncStats::default(),
         })
@@ -977,8 +1111,9 @@ impl<'a> ScanContext<'a> {
 
     fn preserve_previous_entry(&self, relative_path: &str) -> SearchxResult<()> {
         if let Some(previous_entry) = self.previous.files.get(relative_path) {
-            update_progress_manifest_entry(
-                self.progress_manifest.as_ref(),
+            send_progress_event(
+                self.event_sender,
+                self.cancel_flag,
                 relative_path,
                 previous_entry,
             )?;
@@ -991,8 +1126,9 @@ impl<'a> ScanContext<'a> {
         relative_path: &str,
         previous_entry: &ManifestEntry,
     ) -> SearchxResult<()> {
-        update_progress_manifest_entry(
-            self.progress_manifest.as_ref(),
+        send_progress_event(
+            self.event_sender,
+            self.cancel_flag,
             relative_path,
             previous_entry,
         )?;
@@ -1015,6 +1151,12 @@ impl<'a> ScanContext<'a> {
             SkipReason::Binary => self.stats.skipped_binary += 1,
         }
 
+        let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
+        let progress = ProgressUpdate {
+            path: relative_path.to_string(),
+            entry,
+        };
+
         if self
             .previous
             .files
@@ -1024,13 +1166,20 @@ impl<'a> ScanContext<'a> {
             send_index_event(
                 self.event_sender,
                 self.cancel_flag,
-                IndexEvent::Delete(document_id_for_path(relative_path)),
+                IndexEvent::Delete {
+                    document_id: document_id_for_path(relative_path),
+                    progress: Some(progress),
+                },
             )?;
             self.stats.deleted_became_unsupported += 1;
+            return Ok(());
         }
 
-        let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
-        update_progress_manifest_entry(self.progress_manifest.as_ref(), relative_path, &entry)
+        send_index_event(
+            self.event_sender,
+            self.cancel_flag,
+            IndexEvent::Progress(progress),
+        )
     }
 
     fn index_document(
@@ -1054,11 +1203,16 @@ impl<'a> ScanContext<'a> {
             vectors,
         };
         let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed);
-        update_progress_manifest_entry(self.progress_manifest.as_ref(), relative_path, &entry)?;
         send_index_event(
             self.event_sender,
             self.cancel_flag,
-            IndexEvent::Upsert(serde_json::to_string(&document)?),
+            IndexEvent::Upsert {
+                document: serde_json::to_string(&document)?,
+                progress: ProgressUpdate {
+                    path: relative_path.to_string(),
+                    entry,
+                },
+            },
         )?;
         self.stats.indexed_or_updated += 1;
         Ok(())
@@ -1070,7 +1224,10 @@ impl<'a> ScanContext<'a> {
                 send_index_event(
                     self.event_sender,
                     self.cancel_flag,
-                    IndexEvent::Delete(document_id_for_path(path)),
+                    IndexEvent::Delete {
+                        document_id: document_id_for_path(path),
+                        progress: None,
+                    },
                 )?;
                 self.stats.deleted_missing += 1;
             }
@@ -1103,15 +1260,20 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn update_progress_manifest_entry(
-    progress_manifest: Option<&ManifestWorkingSet>,
+fn send_progress_event(
+    event_sender: &mpsc::SyncSender<IndexEvent>,
+    cancel_flag: &AtomicBool,
     relative_path: &str,
     entry: &ManifestEntry,
 ) -> SearchxResult<()> {
-    if let Some(progress_manifest) = progress_manifest {
-        progress_manifest.update_entry(relative_path, entry)?;
-    }
-    Ok(())
+    send_index_event(
+        event_sender,
+        cancel_flag,
+        IndexEvent::Progress(ProgressUpdate {
+            path: relative_path.to_string(),
+            entry: entry.clone(),
+        }),
+    )
 }
 
 fn report_scan_error(error_sender: Option<&mpsc::Sender<ScanError>>, error: ScanError) {
@@ -1261,6 +1423,7 @@ pub fn commit_working_manifest(path: &Path, root: &Path) -> SearchxResult<()> {
          FROM working_manifest_files",
         [],
     )?;
+    tx.execute("DELETE FROM working_manifest_info", [])?;
     tx.execute("DELETE FROM working_manifest_files", [])?;
     tx.commit()?;
     Ok(())
@@ -1294,10 +1457,6 @@ where
     }
 }
 
-fn discard_working_manifest_quietly(path: &Path) {
-    let _ = discard_working_manifest(path);
-}
-
 fn report_sync_progress<F>(
     scan_hook: &ScanHook,
     last_reported_file: &mut Option<String>,
@@ -1320,17 +1479,28 @@ fn report_sync_progress<F>(
 struct PendingIndexBatch {
     upserts: Vec<String>,
     deleted_ids: Vec<String>,
+    progress_updates: Vec<ProgressUpdate>,
     bytes: usize,
 }
 
 impl PendingIndexBatch {
     fn push(&mut self, event: IndexEvent) {
         match event {
-            IndexEvent::Upsert(document) => {
+            IndexEvent::Upsert { document, progress } => {
                 self.bytes += document.len();
                 self.upserts.push(document);
+                self.progress_updates.push(progress);
             }
-            IndexEvent::Delete(document_id) => self.deleted_ids.push(document_id),
+            IndexEvent::Delete {
+                document_id,
+                progress,
+            } => {
+                self.deleted_ids.push(document_id);
+                if let Some(progress) = progress {
+                    self.progress_updates.push(progress);
+                }
+            }
+            IndexEvent::Progress(progress) => self.progress_updates.push(progress),
         }
     }
 
@@ -1338,28 +1508,40 @@ impl PendingIndexBatch {
         self.upserts.len() >= INDEX_BATCH_DOC_LIMIT
             || self.deleted_ids.len() >= INDEX_BATCH_DELETE_LIMIT
             || self.bytes >= INDEX_BATCH_BYTE_LIMIT
+            || self.progress_updates.len() >= MANIFEST_BATCH_ENTRY_LIMIT
     }
 
     fn flush(
         &mut self,
         index: &Index,
         indexer_config: &IndexerConfig,
+        progress_manifest: Option<&ManifestWorkingSet>,
         data_paths: &DataPaths,
     ) -> SearchxResult<()> {
-        if self.upserts.is_empty() && self.deleted_ids.is_empty() {
+        if self.upserts.is_empty()
+            && self.deleted_ids.is_empty()
+            && self.progress_updates.is_empty()
+        {
             return Ok(());
         }
 
-        apply_index_batch(
-            index,
-            indexer_config,
-            &data_paths.base,
-            &self.upserts,
-            &self.deleted_ids,
-        )?;
+        if !self.upserts.is_empty() || !self.deleted_ids.is_empty() {
+            apply_index_batch(
+                index,
+                indexer_config,
+                &data_paths.base,
+                &self.upserts,
+                &self.deleted_ids,
+            )?;
+        }
+
+        if let Some(progress_manifest) = progress_manifest {
+            progress_manifest.update_entries(&self.progress_updates)?;
+        }
 
         self.upserts.clear();
         self.deleted_ids.clear();
+        self.progress_updates.clear();
         self.bytes = 0;
         Ok(())
     }
@@ -1368,26 +1550,71 @@ impl PendingIndexBatch {
 fn cancel_scan_thread(
     scan_handle: thread::JoinHandle<SearchxResult<SyncStats>>,
     cancel_flag: &AtomicBool,
-    manifest_path: &Path,
 ) {
     cancel_flag.store(true, Ordering::Relaxed);
     let _ = scan_handle.join();
-    discard_working_manifest_quietly(manifest_path);
 }
 
 fn finish_scan_thread(
     scan_handle: thread::JoinHandle<SearchxResult<SyncStats>>,
-    manifest_path: &Path,
 ) -> SearchxResult<SyncStats> {
     match scan_handle.join() {
-        Ok(result) => result.inspect_err(|_| discard_working_manifest_quietly(manifest_path)),
-        Err(payload) => {
-            discard_working_manifest_quietly(manifest_path);
-            Err(SearchxError::ScanThreadPanicked {
-                message: panic_message(payload.as_ref()),
-            })
+        Ok(result) => result,
+        Err(payload) => Err(SearchxError::ScanThreadPanicked {
+            message: panic_message(payload.as_ref()),
+        }),
+    }
+}
+
+fn repair_index_from_working_manifest(
+    index: &Index,
+    indexer_config: &IndexerConfig,
+    data_paths: &DataPaths,
+    root: &Path,
+) -> SearchxResult<()> {
+    if !data_paths.manifest.exists() {
+        return Ok(());
+    }
+
+    let conn = open_manifest_connection(&data_paths.manifest)?;
+    let Some(working_manifest) = load_working_manifest(&conn, root)? else {
+        return Ok(());
+    };
+
+    let indexed_paths = working_manifest
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.is_indexed())
+        .map(|(path, _)| path.as_str())
+        .collect::<HashSet<_>>();
+
+    let rtxn = index.read_txn()?;
+    let fields_ids_map = index.fields_ids_map(&rtxn)?;
+    let mut orphaned_ids = Vec::new();
+
+    for document in index.all_documents(&rtxn)? {
+        let (_docid, obkv) = document?;
+        let value = all_obkv_to_json(obkv, &fields_ids_map)?;
+        let path = value.get("path").and_then(|entry| entry.as_str());
+        let id = value.get("id").and_then(|entry| entry.as_str());
+
+        match path {
+            Some(path) if indexed_paths.contains(path) => {}
+            Some(path) => orphaned_ids.push(document_id_for_path(path)),
+            None => {
+                if let Some(id) = id {
+                    orphaned_ids.push(id.to_string());
+                }
+            }
         }
     }
+    drop(rtxn);
+
+    if !orphaned_ids.is_empty() {
+        apply_index_batch(index, indexer_config, &data_paths.base, &[], &orphaned_ids)?;
+    }
+
+    Ok(())
 }
 
 struct StreamScanJob<'a> {
@@ -1397,6 +1624,7 @@ struct StreamScanJob<'a> {
     root: &'a Path,
     data_paths: &'a DataPaths,
     previous_manifest: Manifest,
+    resume_existing_progress: bool,
 }
 
 fn stream_scan_into_index<F>(
@@ -1414,21 +1642,22 @@ where
         root,
         data_paths,
         previous_manifest,
+        resume_existing_progress,
     } = job;
 
+    let progress_manifest =
+        ManifestWorkingSet::open(&data_paths.manifest, root, resume_existing_progress)?;
     let (event_tx, event_rx) = mpsc::sync_channel(INDEX_EVENT_CHANNEL_CAPACITY);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let scan_options = options.clone();
     let scan_root_path = root.to_path_buf();
     let scan_data_dir = data_paths.base.clone();
-    let scan_manifest_path = data_paths.manifest.clone();
     let scan_hook_for_thread = Arc::clone(scan_hook);
     let cancel_flag_for_thread = Arc::clone(&cancel_flag);
     let (scan_error_tx, scan_error_rx) = mpsc::channel();
 
     let scan_handle = thread::spawn(move || {
         let pipeline = ScanPipeline {
-            progress_manifest_db: Some(scan_manifest_path),
             error_sender: Some(scan_error_tx),
             event_sender: event_tx,
             cancel_flag: cancel_flag_for_thread,
@@ -1455,32 +1684,36 @@ where
             Ok(event) => {
                 pending_batch.push(event);
                 if pending_batch.should_flush()
-                    && let Err(error) = pending_batch.flush(index, indexer_config, data_paths)
+                    && let Err(error) = pending_batch.flush(
+                        index,
+                        indexer_config,
+                        Some(&progress_manifest),
+                        data_paths,
+                    )
                 {
                     drop(event_rx);
-                    cancel_scan_thread(scan_handle, &cancel_flag, &data_paths.manifest);
+                    cancel_scan_thread(scan_handle, &cancel_flag);
                     return Err(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = pending_batch.flush(index, indexer_config, data_paths) {
+                if let Err(error) =
+                    pending_batch.flush(index, indexer_config, Some(&progress_manifest), data_paths)
+                {
                     drop(event_rx);
-                    cancel_scan_thread(scan_handle, &cancel_flag, &data_paths.manifest);
+                    cancel_scan_thread(scan_handle, &cancel_flag);
                     return Err(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break finish_scan_thread(scan_handle, &data_paths.manifest)?;
+                break finish_scan_thread(scan_handle)?;
             }
         }
     };
 
     drain_scan_errors(&scan_error_rx, on_progress);
 
-    if let Err(error) = pending_batch.flush(index, indexer_config, data_paths) {
-        discard_working_manifest_quietly(&data_paths.manifest);
-        return Err(error);
-    }
+    pending_batch.flush(index, indexer_config, Some(&progress_manifest), data_paths)?;
 
     Ok(scan_result)
 }
@@ -1502,7 +1735,10 @@ where
     let ManifestLoad {
         manifest,
         rebuild_reason,
+        resume_from_incomplete,
     } = load_manifest(&data_paths, &root, request.options.rebuild)?;
+
+    let recovering_incomplete = data_paths.incomplete_marker.exists() && rebuild_reason.is_none();
 
     if let Some(reason) = rebuild_reason.as_ref() {
         on_progress(SyncProgress::Rebuilding {
@@ -1535,15 +1771,17 @@ where
             root: &root,
             data_paths: &data_paths,
             previous_manifest: manifest,
+            resume_existing_progress: resume_from_incomplete,
         },
         &scan_hook,
         &mut on_progress,
     )?;
 
-    if let Err(error) = commit_working_manifest(&data_paths.manifest, &root) {
-        discard_working_manifest_quietly(&data_paths.manifest);
-        return Err(error);
+    if recovering_incomplete {
+        repair_index_from_working_manifest(&index, &indexer_config, &data_paths, &root)?;
     }
+
+    commit_working_manifest(&data_paths.manifest, &root)?;
 
     clear_index_incomplete(&data_paths)?;
 
@@ -1638,7 +1876,6 @@ mod tests {
             &empty_manifest(root),
             None,
             &ScanPipeline {
-                progress_manifest_db: None,
                 error_sender: None,
                 event_sender: event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -1649,11 +1886,11 @@ mod tests {
         event_rx
             .into_iter()
             .filter_map(|event| match event {
-                IndexEvent::Upsert(document) => {
+                IndexEvent::Upsert { document, .. } => {
                     let value: serde_json::Value = serde_json::from_str(&document).unwrap();
                     Some(value["path"].as_str().unwrap().to_string())
                 }
-                IndexEvent::Delete(_) => None,
+                IndexEvent::Delete { .. } | IndexEvent::Progress(_) => None,
             })
             .collect()
     }
@@ -1703,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn load_manifest_requests_rebuild_when_previous_run_was_incomplete() {
+    fn load_manifest_resumes_from_working_state_when_previous_run_was_incomplete() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().join("root");
         let data_paths = DataPaths {
@@ -1719,13 +1956,56 @@ mod tests {
                 .join(INCOMPLETE_FILE_NAME),
         };
         fs::create_dir_all(&root).unwrap();
+        let previous = Manifest {
+            version: MANIFEST_VERSION,
+            root: root.display().to_string(),
+            files: BTreeMap::from([(
+                "old.txt".to_string(),
+                ManifestEntry::from_fingerprint(
+                    FileFingerprint {
+                        size: 1,
+                        modified_secs: 2,
+                        modified_nanos: 3,
+                    },
+                    FileState::Indexed,
+                ),
+            )]),
+        };
+
+        let mut conn = open_manifest_connection(&data_paths.manifest).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO manifest_info (singleton, version, root) VALUES (1, ?1, ?2)",
+            params![MANIFEST_VERSION, root.display().to_string()],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO manifest_files (path, size, modified_secs, modified_nanos, state, skip_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params!["old.txt", 1i64, 2i64, 3i64, "indexed", Option::<&str>::None],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let working = ManifestWorkingSet::open(&data_paths.manifest, &root, false).unwrap();
+        let resumed_entry = ManifestEntry::from_fingerprint(
+            FileFingerprint {
+                size: 7,
+                modified_secs: 8,
+                modified_nanos: 9,
+            },
+            FileState::Indexed,
+        );
+        working.update_entry("new.txt", &resumed_entry).unwrap();
         mark_index_incomplete(&data_paths).unwrap();
 
         let loaded = load_manifest(&data_paths, &root, false).unwrap();
+        assert!(loaded.rebuild_reason.is_none());
+        assert!(loaded.resume_from_incomplete);
         assert_eq!(
-            loaded.rebuild_reason,
-            Some("previous indexing run did not complete cleanly".to_string())
+            loaded.manifest.files.get("old.txt"),
+            previous.files.get("old.txt")
         );
+        assert_eq!(loaded.manifest.files.get("new.txt"), Some(&resumed_entry));
     }
 
     #[test]
@@ -1772,7 +2052,7 @@ mod tests {
             ]),
         };
 
-        let working = ManifestWorkingSet::open(&data_paths.manifest).unwrap();
+        let working = ManifestWorkingSet::open(&data_paths.manifest, &root, false).unwrap();
         for (path, entry) in &expected.files {
             working.update_entry(path, entry).unwrap();
         }
@@ -1782,7 +2062,7 @@ mod tests {
         assert!(loaded.rebuild_reason.is_none());
         assert_eq!(loaded.manifest, expected);
 
-        let stale_working = ManifestWorkingSet::open(&data_paths.manifest).unwrap();
+        let stale_working = ManifestWorkingSet::open(&data_paths.manifest, &root, false).unwrap();
         let stale_entry = ManifestEntry::from_fingerprint(
             FileFingerprint {
                 size: 1,
@@ -1799,5 +2079,68 @@ mod tests {
         assert_eq!(loaded_again.manifest, expected);
 
         discard_working_manifest(&data_paths.manifest).unwrap();
+    }
+
+    #[test]
+    fn sync_repairs_orphaned_documents_after_incomplete_run() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("root");
+        let base = temp_dir.path().join(".searchx-data");
+        let data_paths = DataPaths {
+            base: base.clone(),
+            index: base.join("index"),
+            manifest: base.join(MANIFEST_FILE_NAME),
+            incomplete_marker: base.join(INCOMPLETE_FILE_NAME),
+        };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("live.txt"), "live").unwrap();
+        fs::create_dir_all(&data_paths.index).unwrap();
+
+        let index = Index::new(
+            new_heed_options(),
+            &data_paths.index,
+            milli::CreateOrOpen::create_without_shards(),
+        )
+        .unwrap();
+        let indexer_config = IndexerConfig::default();
+        configure_index(&index, &indexer_config).unwrap();
+
+        let stale_document = IndexedDocument {
+            id: document_id_for_path("stale.txt"),
+            path: "stale.txt".to_string(),
+            file_name: "stale.txt".to_string(),
+            extension: Some("txt".to_string()),
+            contents: "stale".to_string(),
+            vectors: document_vectors("stale.txt", "stale"),
+        };
+        apply_index_batch(
+            &index,
+            &indexer_config,
+            &data_paths.base,
+            &[serde_json::to_string(&stale_document).unwrap()],
+            &[],
+        )
+        .unwrap();
+        drop(index);
+
+        let _working = ManifestWorkingSet::open(&data_paths.manifest, &root, false).unwrap();
+        mark_index_incomplete(&data_paths).unwrap();
+
+        let result = sync_index(
+            &SyncRequest::new(&root)
+                .with_data_dir(&data_paths.base)
+                .with_options(ScanOptions {
+                    max_file_bytes: u64::MAX,
+                    ..ScanOptions::default()
+                }),
+        )
+        .unwrap();
+
+        let stale_results = search_index(&result.index, "stale", 10).unwrap();
+        assert_eq!(stale_results.candidate_count, 0);
+
+        let live_results = search_index(&result.index, "live", 10).unwrap();
+        assert_eq!(live_results.candidate_count, 1);
+        assert_eq!(live_results.hits[0].path, "live.txt");
     }
 }
