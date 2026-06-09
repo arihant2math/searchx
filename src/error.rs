@@ -20,6 +20,8 @@ pub enum SearchxError {
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
+    SimdJson(#[from] simd_json::Error),
+    #[error(transparent)]
     IntegerConversion(#[from] TryFromIntError),
     #[error(transparent)]
     StripPrefix(#[from] StripPrefixError),

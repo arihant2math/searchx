@@ -441,31 +441,35 @@ where
     let embedding_event_tx = event_tx.clone();
     let (scan_error_tx, scan_error_rx) = mpsc::channel();
 
-    let embedding_handle = thread::Builder::new().name("Embedding Thread".to_string()).spawn(move || {
-        run_embedding_thread(
-            embedding_job_rx,
-            embedding_event_tx,
-            cancel_flag_for_embedding,
-        )
-    })?;
+    let embedding_handle = thread::Builder::new()
+        .name("Embedding Thread".to_string())
+        .spawn(move || {
+            run_embedding_thread(
+                embedding_job_rx,
+                embedding_event_tx,
+                cancel_flag_for_embedding,
+            )
+        })?;
 
-    let scan_handle = thread::Builder::new().name("Scan Thread".to_string()).spawn(move || {
-        let pipeline = ScanPipeline {
-            error_sender: Some(scan_error_tx),
-            event_sender: event_tx,
-            embedding_sender: Some(embedding_job_tx),
-            cancel_flag: cancel_flag_for_thread,
-        };
+    let scan_handle = thread::Builder::new()
+        .name("Scan Thread".to_string())
+        .spawn(move || {
+            let pipeline = ScanPipeline {
+                error_sender: Some(scan_error_tx),
+                event_sender: event_tx,
+                embedding_sender: Some(embedding_job_tx),
+                cancel_flag: cancel_flag_for_thread,
+            };
 
-        scan_root(
-            &scan_options,
-            &scan_root_path,
-            &scan_data_dir,
-            &previous_manifest,
-            Some(scan_hook_for_thread.as_ref()),
-            &pipeline,
-        )
-    })?;
+            scan_root(
+                &scan_options,
+                &scan_root_path,
+                &scan_data_dir,
+                &previous_manifest,
+                Some(scan_hook_for_thread.as_ref()),
+                &pipeline,
+            )
+        })?;
 
     let mut last_reported_file = None;
     let mut pending_batch = PendingIndexBatch::default();

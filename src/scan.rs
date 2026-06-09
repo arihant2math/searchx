@@ -376,7 +376,7 @@ impl<'a> ScanContext<'a> {
             self.cancel_flag,
             IndexEvent::Upsert {
                 document_id,
-                document: serde_json::to_string(&document)?,
+                document: simd_json::to_string(&document)?,
                 progress: Some(ProgressUpdate {
                     path: relative_path.to_string(),
                     entry: ManifestEntry::from_fingerprint(fingerprint, initial_state),
