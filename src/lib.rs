@@ -19,6 +19,7 @@ pub use embedding::EmbeddingInput;
 pub use error::{SearchxError, SearchxResult};
 pub use index::{
     apply_index_batch, configure_index, generate_document_vector, new_heed_options, search_index,
+    search_index_vector,
 };
 pub use manifest::{
     Manifest, clear_index_incomplete, commit_working_manifest, data_paths,

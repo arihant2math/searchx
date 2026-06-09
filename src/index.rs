@@ -4,7 +4,7 @@ use crate::constants::{
     VECTOR_EMBEDDER_NAME, VECTOR_STORE_BACKEND,
 };
 use crate::embedding::{Embedder, EmbeddingInput, OwnedEmbeddingInput};
-use crate::error::SearchxResult;
+use crate::error::{SearchxError, SearchxResult};
 use bumpalo::Bump;
 use http_client::policy::IpPolicy;
 use memmap2::Mmap;
@@ -13,8 +13,10 @@ use milli::index::EmbeddingsWithMetadata;
 use milli::progress::{EmbedderStats, Progress};
 use milli::update::new::indexer;
 use milli::update::{IndexerConfig, MissingDocumentPolicy, Setting, Settings};
+use milli::vector::embedder::manual;
 use milli::vector::parsed_vectors::ExplicitVectors;
 use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
+use milli::vector::{Embedder as MilliSearchEmbedder, EmbedderOptions as MilliEmbedderOptions};
 use milli::{Index, obkv_to_json};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -85,9 +87,11 @@ pub(crate) fn embedded_document_vectors(vector: Vec<f32>) -> IndexedVectors {
     indexed_vectors(Some(vector))
 }
 
-#[must_use]
-pub fn generate_document_vector(input: EmbeddingInput<'_>) -> Option<Vec<f32>> {
-    let input = OwnedEmbeddingInput::from_borrowed(input)?;
+fn embed_input(input: EmbeddingInput<'_>) -> SearchxResult<Vec<f32>> {
+    let input =
+        OwnedEmbeddingInput::from_borrowed(input).ok_or_else(|| SearchxError::Embedding {
+            message: "embedding input type is not supported".to_string(),
+        })?;
     static EMBEDDER: OnceLock<Mutex<Embedder>> = OnceLock::new();
     let embedder = EMBEDDER.get_or_init(|| Mutex::new(Embedder::default()));
 
@@ -95,7 +99,11 @@ pub fn generate_document_vector(input: EmbeddingInput<'_>) -> Option<Vec<f32>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .embed(&input)
-        .ok()
+}
+
+#[must_use]
+pub fn generate_document_vector(input: EmbeddingInput<'_>) -> Option<Vec<f32>> {
+    embed_input(input).ok()
 }
 
 /// Get all vectors for a document, keyed by embedder name.
@@ -198,21 +206,20 @@ pub fn apply_index_batch(
     Ok(())
 }
 
-pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<SearchResults> {
-    let rtxn = index.read_txn()?;
-    let progress = Progress::default();
-    let mut search = milli::Search::new(&rtxn, index, &progress);
-    search.query(query);
-    search.limit(limit);
-
-    let result = search.execute()?;
+fn build_search_results(
+    index: &Index,
+    rtxn: &milli::heed::RoTxn<'_>,
+    progress: &Progress,
+    query: &str,
+    result: milli::SearchResult,
+) -> SearchxResult<SearchResults> {
     let candidate_count = result.candidates.len();
-    let fields_ids_map = index.fields_ids_map(&rtxn)?;
+    let fields_ids_map = index.fields_ids_map(rtxn)?;
     let all_fields = fields_ids_map.iter().map(|(id, _)| id).collect::<Vec<_>>();
     let mut hits = Vec::new();
 
     for (rank, (docid, obkv)) in index
-        .documents(&rtxn, result.documents_ids)?
+        .documents(rtxn, result.documents_ids)?
         .into_iter()
         .enumerate()
     {
@@ -229,7 +236,7 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<S
                 regenerate,
                 has_fragments: _,
             },
-        ) in index.embeddings(&rtxn, docid)?
+        ) in index.embeddings(rtxn, docid)?
         {
             let explicit_vectors = ExplicitVectors {
                 embeddings: Some(embeddings.into()),
@@ -257,6 +264,60 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<S
         candidate_count,
         hits,
     })
+}
+
+fn vector_search_embedder(
+    index: &Index,
+    rtxn: &milli::heed::RoTxn<'_>,
+    dimensions: usize,
+) -> SearchxResult<(String, Arc<MilliSearchEmbedder>, bool)> {
+    let config = index
+        .embedding_configs()
+        .embedding_configs(rtxn)?
+        .into_iter()
+        .find(|config| config.name == VECTOR_EMBEDDER_NAME)
+        .ok_or_else(|| SearchxError::Embedding {
+            message: format!("vector embedder `{VECTOR_EMBEDDER_NAME}` is not configured"),
+        })?;
+    let quantized = config.config.quantized();
+    let distribution = match config.config.embedder_options {
+        MilliEmbedderOptions::UserProvided(options) => options.distribution,
+        _ => None,
+    };
+    let embedder = Arc::new(MilliSearchEmbedder::UserProvided(manual::Embedder::new(
+        manual::EmbedderOptions {
+            dimensions,
+            distribution,
+        },
+    )));
+
+    Ok((config.name, embedder, quantized))
+}
+
+pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<SearchResults> {
+    let rtxn = index.read_txn()?;
+    let progress = Progress::default();
+    let mut search = milli::Search::new(&rtxn, index, &progress);
+    search.query(query);
+    search.limit(limit);
+
+    build_search_results(index, &rtxn, &progress, query, search.execute()?)
+}
+
+pub fn search_index_vector(
+    index: &Index,
+    query: &str,
+    limit: usize,
+) -> SearchxResult<SearchResults> {
+    let vector = embed_input(EmbeddingInput::Text(query))?;
+    let rtxn = index.read_txn()?;
+    let progress = Progress::default();
+    let mut search = milli::Search::new(&rtxn, index, &progress);
+    let (embedder_name, embedder, quantized) = vector_search_embedder(index, &rtxn, vector.len())?;
+    search.semantic(embedder_name, embedder, quantized, Some(vector), None);
+    search.limit(limit);
+
+    build_search_results(index, &rtxn, &progress, query, search.execute()?)
 }
 
 #[must_use]

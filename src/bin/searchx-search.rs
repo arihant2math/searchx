@@ -1,7 +1,8 @@
 use clap::Parser;
 use milli::Index;
 use searchx::{
-    DEFAULT_DATA_DIR_NAME, SearchResults, SearchxResult, data_paths, new_heed_options, search_index,
+    DEFAULT_DATA_DIR_NAME, SearchResults, SearchxResult, data_paths, new_heed_options,
+    search_index, search_index_vector,
 };
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,9 @@ struct Args {
     /// Maximum number of search hits to print
     #[arg(short = 'l', long, default_value_t = 10)]
     limit: usize,
+    /// Vectorize the query and search indexed vectors instead of keyword search
+    #[arg(short = 'v', long)]
+    vector: bool,
 }
 
 fn open_existing_index(data_dir: &Path) -> SearchxResult<Index> {
@@ -59,7 +63,11 @@ fn run() -> SearchxResult<()> {
     }
 
     let index = open_existing_index(&args.data_dir)?;
-    let results = search_index(&index, query, args.limit)?;
+    let results = if args.vector {
+        search_index_vector(&index, query, args.limit)?
+    } else {
+        search_index(&index, query, args.limit)?
+    };
     print_search_results(&results);
     Ok(())
 }

@@ -409,3 +409,36 @@ fn sync_indexes_binary_and_oversized_files_by_name() {
     assert_eq!(recording_results.hits[0].path, "recording.mp4");
     assert_eq!(recording_results.hits[0].document["contents"], "");
 }
+
+#[test]
+fn vector_search_uses_vectorized_query_embeddings() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().join("root");
+    let data_dir = temp_dir.path().join(".searchx-data");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("alpha.txt"), "alpha semantic target").unwrap();
+    fs::write(root.join("beta.txt"), "beta semantic target").unwrap();
+
+    let result = sync_index(
+        &SyncRequest::new(&root)
+            .with_data_dir(&data_dir)
+            .with_options(ScanOptions {
+                max_file_bytes: u64::MAX,
+                ..ScanOptions::default()
+            }),
+    )
+    .unwrap();
+
+    let vector_results = search_index_vector(&result.index, "beta semantic target", 2).unwrap();
+
+    assert_eq!(vector_results.query, "beta semantic target");
+    assert!(vector_results.candidate_count >= 1);
+    assert_eq!(vector_results.hits[0].path, "beta.txt");
+    assert_eq!(
+        vector_results.hits[0].document["_vectors"][VECTOR_EMBEDDER_NAME]["embeddings"][0]
+            .as_array()
+            .unwrap()
+            .len(),
+        VECTOR_DIMENSIONS
+    );
+}
