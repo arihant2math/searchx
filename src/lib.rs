@@ -11,6 +11,7 @@ use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
 use milli::{Index, all_obkv_to_json};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::error::Error;
@@ -21,7 +22,8 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::time::UNIX_EPOCH;
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 const MANIFEST_VERSION: u32 = 1;
@@ -29,10 +31,17 @@ const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
 const INCOMPLETE_FILE_NAME: &str = "indexing-incomplete";
 const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const PRIMARY_KEY: &str = "id";
+pub const DEFAULT_DATA_DIR_NAME: &str = ".searchx-data";
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 pub const VECTOR_EMBEDDER_NAME: &str = "default";
 pub const VECTOR_DIMENSIONS: usize = 1536;
 const VECTOR_STORE_BACKEND: VectorStoreBackend = VectorStoreBackend::Arroy;
 const SEARCHABLE_FIELDS: [&str; 4] = ["file_name", "path", "contents", "extension"];
+const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const INDEX_EVENT_CHANNEL_CAPACITY: usize = 32;
+const INDEX_BATCH_DOC_LIMIT: usize = 128;
+const INDEX_BATCH_DELETE_LIMIT: usize = 512;
+const INDEX_BATCH_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 const DEFAULT_IGNORE_RULES: &[&str] = &[
     ".git/",
     "node_modules/",
@@ -58,6 +67,72 @@ pub struct ScanOptions {
     pub ignore_rules: Vec<String>,
 }
 
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            rebuild: false,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            ignore_rules: default_ignore_rules(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncRequest {
+    pub root: PathBuf,
+    pub data_dir: PathBuf,
+    pub options: ScanOptions,
+}
+
+impl SyncRequest {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR_NAME),
+            options: ScanOptions::default(),
+        }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = data_dir.into();
+        self
+    }
+
+    pub fn with_options(mut self, options: ScanOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SyncProgress {
+    Rebuilding { reason: String },
+    Indexing { path: String },
+    ScanError(ScanError),
+}
+
+pub struct SyncIndexResult {
+    pub root: PathBuf,
+    pub data_paths: DataPaths,
+    pub index: Index,
+    pub stats: SyncStats,
+    pub rebuild_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub rank: usize,
+    pub path: String,
+    pub document: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    pub query: String,
+    pub candidate_count: u64,
+    pub hits: Vec<SearchHit>,
+}
+
 pub fn default_ignore_rules() -> Vec<String> {
     DEFAULT_IGNORE_RULES
         .iter()
@@ -65,7 +140,7 @@ pub fn default_ignore_rules() -> Vec<String> {
         .collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataPaths {
     pub base: PathBuf,
     pub index: PathBuf,
@@ -239,7 +314,7 @@ struct IndexedDocument {
     vectors: IndexedVectors,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncStats {
     pub scanned_files: u64,
     pub unchanged_indexed: u64,
@@ -1092,7 +1167,276 @@ pub fn discard_working_manifest(path: &Path) -> Result<(), Box<dyn Error>> {
     clear_working_manifest(&conn)
 }
 
-pub fn search_index(index: &Index, query: &str, limit: usize) -> Result<(), Box<dyn Error>> {
+fn panic_message(payload: Box<dyn Any + Send + 'static>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn drain_scan_errors<F>(error_rx: &mpsc::Receiver<ScanError>, on_progress: &mut F)
+where
+    F: FnMut(SyncProgress),
+{
+    while let Ok(error) = error_rx.try_recv() {
+        on_progress(SyncProgress::ScanError(error));
+    }
+}
+
+fn discard_working_manifest_quietly(path: &Path) {
+    let _ = discard_working_manifest(path);
+}
+
+fn report_sync_progress<F>(
+    scan_hook: &ScanHook,
+    last_reported_file: &mut Option<String>,
+    on_progress: &mut F,
+) where
+    F: FnMut(SyncProgress),
+{
+    let current_file = scan_hook.current_file();
+    if current_file != *last_reported_file {
+        if let Some(path) = current_file.as_deref() {
+            on_progress(SyncProgress::Indexing {
+                path: path.to_string(),
+            });
+        }
+        *last_reported_file = current_file;
+    }
+}
+
+fn flush_index_batch(
+    index: &Index,
+    indexer_config: &IndexerConfig,
+    data_paths: &DataPaths,
+    pending_upserts: &mut Vec<String>,
+    pending_deleted_ids: &mut Vec<String>,
+    pending_bytes: &mut usize,
+) -> Result<(), Box<dyn Error>> {
+    if pending_upserts.is_empty() && pending_deleted_ids.is_empty() {
+        return Ok(());
+    }
+
+    apply_index_batch(
+        index,
+        indexer_config,
+        &data_paths.base,
+        pending_upserts,
+        pending_deleted_ids,
+    )?;
+
+    pending_upserts.clear();
+    pending_deleted_ids.clear();
+    *pending_bytes = 0;
+    Ok(())
+}
+
+fn stream_scan_into_index<F>(
+    index: &Index,
+    indexer_config: &IndexerConfig,
+    options: &ScanOptions,
+    root: &Path,
+    data_paths: &DataPaths,
+    previous_manifest: Manifest,
+    scan_hook: Arc<ScanHook>,
+    on_progress: &mut F,
+) -> Result<SyncStats, Box<dyn Error>>
+where
+    F: FnMut(SyncProgress),
+{
+    let (event_tx, event_rx) = mpsc::sync_channel(INDEX_EVENT_CHANNEL_CAPACITY);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let scan_options = options.clone();
+    let scan_root_path = root.to_path_buf();
+    let scan_data_dir = data_paths.base.clone();
+    let scan_manifest_path = data_paths.manifest.clone();
+    let scan_hook_for_thread = scan_hook.clone();
+    let cancel_flag_for_thread = cancel_flag.clone();
+    let (scan_error_tx, scan_error_rx) = mpsc::channel();
+
+    let scan_handle = thread::spawn(move || {
+        scan_root(
+            &scan_options,
+            &scan_root_path,
+            &scan_data_dir,
+            &previous_manifest,
+            Some(scan_hook_for_thread),
+            ScanPipeline {
+                progress_manifest_db: Some(scan_manifest_path),
+                error_sender: Some(scan_error_tx),
+                event_sender: event_tx,
+                cancel_flag: cancel_flag_for_thread,
+            },
+        )
+        .map_err(|error| error.to_string())
+    });
+
+    let mut last_reported_file = None;
+    let mut pending_upserts = Vec::new();
+    let mut pending_deleted_ids = Vec::new();
+    let mut pending_bytes = 0usize;
+
+    let scan_result = loop {
+        drain_scan_errors(&scan_error_rx, on_progress);
+        report_sync_progress(&scan_hook, &mut last_reported_file, on_progress);
+
+        match event_rx.recv_timeout(PROGRESS_POLL_INTERVAL) {
+            Ok(event) => {
+                match event {
+                    IndexEvent::Upsert(document) => {
+                        pending_bytes += document.len();
+                        pending_upserts.push(document);
+                    }
+                    IndexEvent::Delete(document_id) => pending_deleted_ids.push(document_id),
+                }
+
+                if (pending_upserts.len() >= INDEX_BATCH_DOC_LIMIT
+                    || pending_deleted_ids.len() >= INDEX_BATCH_DELETE_LIMIT
+                    || pending_bytes >= INDEX_BATCH_BYTE_LIMIT)
+                    && let Err(error) = flush_index_batch(
+                        index,
+                        indexer_config,
+                        data_paths,
+                        &mut pending_upserts,
+                        &mut pending_deleted_ids,
+                        &mut pending_bytes,
+                    )
+                {
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    drop(event_rx);
+                    let _ = scan_handle.join();
+                    discard_working_manifest_quietly(&data_paths.manifest);
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = flush_index_batch(
+                    index,
+                    indexer_config,
+                    data_paths,
+                    &mut pending_upserts,
+                    &mut pending_deleted_ids,
+                    &mut pending_bytes,
+                ) {
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    drop(event_rx);
+                    let _ = scan_handle.join();
+                    discard_working_manifest_quietly(&data_paths.manifest);
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break match scan_handle.join() {
+                    Ok(Ok(summary)) => summary,
+                    Ok(Err(error)) => {
+                        discard_working_manifest_quietly(&data_paths.manifest);
+                        return Err(error.into());
+                    }
+                    Err(payload) => {
+                        discard_working_manifest_quietly(&data_paths.manifest);
+                        return Err(
+                            format!("scan thread panicked: {}", panic_message(payload)).into()
+                        );
+                    }
+                };
+            }
+        }
+    };
+
+    drain_scan_errors(&scan_error_rx, on_progress);
+
+    if let Err(error) = flush_index_batch(
+        index,
+        indexer_config,
+        data_paths,
+        &mut pending_upserts,
+        &mut pending_deleted_ids,
+        &mut pending_bytes,
+    ) {
+        discard_working_manifest_quietly(&data_paths.manifest);
+        return Err(error);
+    }
+
+    Ok(scan_result)
+}
+
+pub fn sync_index(request: &SyncRequest) -> Result<SyncIndexResult, Box<dyn Error>> {
+    sync_index_with_progress(request, |_| {})
+}
+
+pub fn sync_index_with_progress<F>(
+    request: &SyncRequest,
+    mut on_progress: F,
+) -> Result<SyncIndexResult, Box<dyn Error>>
+where
+    F: FnMut(SyncProgress),
+{
+    let root = fs::canonicalize(&request.root)?;
+    let data_paths = data_paths(&request.data_dir)?;
+
+    let ManifestLoad {
+        manifest,
+        rebuild_reason,
+    } = load_manifest(&data_paths, &root, request.options.rebuild)?;
+
+    if let Some(reason) = rebuild_reason.as_ref() {
+        on_progress(SyncProgress::Rebuilding {
+            reason: reason.clone(),
+        });
+        reset_data_dir(&data_paths)?;
+    } else {
+        fs::create_dir_all(&data_paths.index)?;
+    }
+
+    mark_index_incomplete(&data_paths)?;
+
+    let heed_options = new_heed_options();
+    let create_or_open = if data_paths.index.join("data.mdb").exists() {
+        milli::CreateOrOpen::Open
+    } else {
+        milli::CreateOrOpen::create_without_shards()
+    };
+
+    let index = Index::new(heed_options, &data_paths.index, create_or_open)?;
+    let indexer_config = IndexerConfig::default();
+    configure_index(&index, &indexer_config)?;
+
+    let scan_hook = Arc::new(ScanHook::new());
+    let stats = stream_scan_into_index(
+        &index,
+        &indexer_config,
+        &request.options,
+        &root,
+        &data_paths,
+        manifest,
+        scan_hook,
+        &mut on_progress,
+    )?;
+
+    if let Err(error) = commit_working_manifest(&data_paths.manifest, &root) {
+        discard_working_manifest_quietly(&data_paths.manifest);
+        return Err(error);
+    }
+
+    clear_index_incomplete(&data_paths)?;
+
+    Ok(SyncIndexResult {
+        root,
+        data_paths,
+        index,
+        stats,
+        rebuild_reason,
+    })
+}
+
+pub fn search_index(
+    index: &Index,
+    query: &str,
+    limit: usize,
+) -> Result<SearchResults, Box<dyn Error>> {
     let rtxn = index.read_txn()?;
     let progress = Progress::default();
     let mut search = milli::Search::new(&rtxn, index, &progress);
@@ -1100,11 +1444,10 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> Result<(), Box<
     search.limit(limit);
 
     let result = search.execute()?;
-    println!();
-    println!("Query: {query}");
-    println!("Found {} matching documents.", result.candidates.len());
-
+    let candidate_count = result.candidates.len();
     let fields_ids_map = index.fields_ids_map(&rtxn)?;
+    let mut hits = Vec::new();
+
     for (rank, (_docid, obkv)) in index
         .documents(&rtxn, result.documents_ids)?
         .into_iter()
@@ -1114,11 +1457,20 @@ pub fn search_index(index: &Index, query: &str, limit: usize) -> Result<(), Box<
         let path = document
             .get("path")
             .and_then(|value| value.as_str())
-            .unwrap_or("<unknown>");
-        println!("{}. {}", rank + 1, path);
+            .unwrap_or("<unknown>")
+            .to_string();
+        hits.push(SearchHit {
+            rank: rank + 1,
+            path,
+            document: serde_json::Value::Object(document),
+        });
     }
 
-    Ok(())
+    Ok(SearchResults {
+        query: query.to_string(),
+        candidate_count,
+        hits,
+    })
 }
 
 pub fn new_heed_options() -> EnvOpenOptions<WithoutTls> {
