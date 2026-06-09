@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 blake3 = "1.8.2"
 bumpalo = "3.19.0"
+clap = { version = "4.5.40", features = ["derive"] }
 http-client = { git = "https://github.com/meilisearch/meilisearch.git", tag = "v1.46.1", package = "http-client" }
 ignore = "0.4.25"
 memmap2 = "0.9.9"
