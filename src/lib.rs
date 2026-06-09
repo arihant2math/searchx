@@ -14,19 +14,67 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
-use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufWriter, Write};
+use std::num::TryFromIntError;
+use std::path::{Path, PathBuf, StripPrefixError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 use tempfile::NamedTempFile;
+use thiserror::Error;
 
-type SearchxResult<T> = Result<T, Box<dyn Error>>;
+pub type SearchxResult<T> = Result<T, SearchxError>;
+
+#[derive(Debug, Error)]
+pub enum SearchxError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Ignore(#[from] ignore::Error),
+    #[error(transparent)]
+    Heed(#[from] milli::heed::Error),
+    #[error(transparent)]
+    Milli(Box<milli::Error>),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    SerdeJson(#[from] serde_json::Error),
+    #[error(transparent)]
+    IntegerConversion(#[from] TryFromIntError),
+    #[error(transparent)]
+    StripPrefix(#[from] StripPrefixError),
+    #[error("manifest {field} value {value} exceeds sqlite INTEGER range")]
+    ManifestIntegerOverflow { field: &'static str, value: u64 },
+    #[error("manifest {field} value {value} is negative and invalid")]
+    ManifestNegativeValue { field: &'static str, value: i64 },
+    #[error("indexed entry cannot have skip reason {reason}")]
+    IndexedEntryWithSkipReason { reason: String },
+    #[error("skipped entry is missing a skip reason")]
+    MissingSkipReason,
+    #[error("invalid manifest state {state:?} with reason {reason:?}")]
+    InvalidManifestState {
+        state: String,
+        reason: Option<String>,
+    },
+    #[error("scan canceled")]
+    ScanCanceled,
+    #[error("indexing canceled")]
+    IndexingCanceled,
+    #[error("indexing pipeline disconnected")]
+    IndexingPipelineDisconnected,
+    #[error("scan thread panicked: {message}")]
+    ScanThreadPanicked { message: String },
+}
+
+impl From<milli::Error> for SearchxError {
+    fn from(error: milli::Error) -> Self {
+        Self::Milli(Box::new(error))
+    }
+}
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
@@ -418,17 +466,13 @@ struct ManifestWorkingSet {
 }
 
 impl ManifestWorkingSet {
-    fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+    fn open(path: &Path) -> SearchxResult<Self> {
         let conn = open_manifest_connection(path)?;
         clear_working_manifest(&conn)?;
         Ok(Self { conn })
     }
 
-    fn update_entry(
-        &self,
-        relative_path: &str,
-        entry: &ManifestEntry,
-    ) -> Result<(), Box<dyn Error>> {
+    fn update_entry(&self, relative_path: &str, entry: &ManifestEntry) -> SearchxResult<()> {
         let (state, skip_reason) = file_state_to_db(&entry.state);
         self.conn.execute(
             "INSERT INTO working_manifest_files \
@@ -453,7 +497,7 @@ impl ManifestWorkingSet {
     }
 }
 
-fn open_manifest_connection(path: &Path) -> Result<Connection, Box<dyn Error>> {
+fn open_manifest_connection(path: &Path) -> SearchxResult<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -487,12 +531,12 @@ fn open_manifest_connection(path: &Path) -> Result<Connection, Box<dyn Error>> {
     Ok(conn)
 }
 
-fn clear_working_manifest(conn: &Connection) -> Result<(), Box<dyn Error>> {
+fn clear_working_manifest(conn: &Connection) -> SearchxResult<()> {
     conn.execute("DELETE FROM working_manifest_files", [])?;
     Ok(())
 }
 
-fn load_manifest_info(conn: &Connection) -> Result<Option<(u32, String)>, Box<dyn Error>> {
+fn load_manifest_info(conn: &Connection) -> SearchxResult<Option<(u32, String)>> {
     let info = conn
         .query_row(
             "SELECT version, root FROM manifest_info WHERE singleton = 1",
@@ -503,9 +547,7 @@ fn load_manifest_info(conn: &Connection) -> Result<Option<(u32, String)>, Box<dy
     Ok(info)
 }
 
-fn load_manifest_files(
-    conn: &Connection,
-) -> Result<BTreeMap<String, ManifestEntry>, Box<dyn Error>> {
+fn load_manifest_files(conn: &Connection) -> SearchxResult<BTreeMap<String, ManifestEntry>> {
     let mut statement = conn.prepare(
         "SELECT path, size, modified_secs, modified_nanos, state, skip_reason
          FROM manifest_files",
@@ -544,7 +586,7 @@ fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
     }
 }
 
-fn file_state_from_db(state: &str, skip_reason: Option<&str>) -> Result<FileState, Box<dyn Error>> {
+fn file_state_from_db(state: &str, skip_reason: Option<&str>) -> SearchxResult<FileState> {
     match (state, skip_reason) {
         ("indexed", None) => Ok(FileState::Indexed),
         ("skipped", Some("too_large")) => Ok(FileState::Skipped {
@@ -553,24 +595,23 @@ fn file_state_from_db(state: &str, skip_reason: Option<&str>) -> Result<FileStat
         ("skipped", Some("binary")) => Ok(FileState::Skipped {
             reason: SkipReason::Binary,
         }),
-        ("indexed", Some(reason)) => {
-            Err(format!("indexed entry cannot have skip reason {reason}").into())
-        }
-        ("skipped", None) => Err("skipped entry is missing a skip reason".into()),
-        (state, reason) => {
-            Err(format!("invalid manifest state {state:?} with reason {reason:?}").into())
-        }
+        ("indexed", Some(reason)) => Err(SearchxError::IndexedEntryWithSkipReason {
+            reason: reason.to_string(),
+        }),
+        ("skipped", None) => Err(SearchxError::MissingSkipReason),
+        (state, reason) => Err(SearchxError::InvalidManifestState {
+            state: state.to_string(),
+            reason: reason.map(str::to_string),
+        }),
     }
 }
 
-fn i64_from_u64(value: u64, field: &str) -> Result<i64, Box<dyn Error>> {
-    i64::try_from(value)
-        .map_err(|_| format!("manifest {field} value {value} exceeds sqlite INTEGER range").into())
+fn i64_from_u64(value: u64, field: &'static str) -> SearchxResult<i64> {
+    i64::try_from(value).map_err(|_| SearchxError::ManifestIntegerOverflow { field, value })
 }
 
-fn u64_from_i64(value: i64, field: &str) -> SearchxResult<u64> {
-    u64::try_from(value)
-        .map_err(|_| format!("manifest {field} value {value} is negative and invalid").into())
+fn u64_from_i64(value: i64, field: &'static str) -> SearchxResult<u64> {
+    u64::try_from(value).map_err(|_| SearchxError::ManifestNegativeValue { field, value })
 }
 
 fn manifest_load_with_reason(root: &Path, rebuild_reason: Option<String>) -> ManifestLoad {
@@ -593,7 +634,7 @@ fn missing_manifest_load(root: &Path, data_paths: &DataPaths) -> ManifestLoad {
     manifest_load_with_reason(root, rebuild_reason)
 }
 
-pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> Result<DataPaths, Box<dyn Error>> {
+pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> SearchxResult<DataPaths> {
     let base = env::current_dir()?.join(data_dir);
     Ok(DataPaths {
         index: base.join("index"),
@@ -603,13 +644,13 @@ pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> Result<DataPaths, Box<dyn Erro
     })
 }
 
-pub fn mark_index_incomplete(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
+pub fn mark_index_incomplete(data_paths: &DataPaths) -> SearchxResult<()> {
     fs::create_dir_all(&data_paths.base)?;
     fs::write(&data_paths.incomplete_marker, b"incomplete\n")?;
     Ok(())
 }
 
-pub fn clear_index_incomplete(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
+pub fn clear_index_incomplete(data_paths: &DataPaths) -> SearchxResult<()> {
     if data_paths.incomplete_marker.exists() {
         fs::remove_file(&data_paths.incomplete_marker)?;
     }
@@ -693,7 +734,7 @@ pub fn load_manifest(
     })
 }
 
-pub fn reset_data_dir(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
+pub fn reset_data_dir(data_paths: &DataPaths) -> SearchxResult<()> {
     if data_paths.base.exists() {
         fs::remove_dir_all(&data_paths.base)?;
     }
@@ -701,10 +742,7 @@ pub fn reset_data_dir(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn configure_index(
-    index: &Index,
-    indexer_config: &IndexerConfig,
-) -> Result<(), Box<dyn Error>> {
+pub fn configure_index(index: &Index, indexer_config: &IndexerConfig) -> SearchxResult<()> {
     let desired_searchable_fields = SEARCHABLE_FIELDS
         .iter()
         .map(|field| (*field).to_string())
@@ -822,7 +860,7 @@ impl<'a> ScanContext<'a> {
         if let Some(ignore_file) = &custom_ignore_file
             && let Some(error) = walker_builder.add_ignore(ignore_file.path())
         {
-            return Err(Box::new(error));
+            return Err(error.into());
         }
 
         let data_dir = data_dir.to_path_buf();
@@ -847,7 +885,7 @@ impl<'a> ScanContext<'a> {
 
     fn ensure_not_canceled(&self) -> SearchxResult<()> {
         if self.cancel_flag.load(Ordering::Relaxed) {
-            Err("scan canceled".into())
+            Err(SearchxError::ScanCanceled)
         } else {
             Ok(())
         }
@@ -1051,12 +1089,12 @@ fn send_index_event(
     event: IndexEvent,
 ) -> SearchxResult<()> {
     if cancel_flag.load(Ordering::Relaxed) {
-        return Err("indexing canceled".into());
+        return Err(SearchxError::IndexingCanceled);
     }
 
     event_sender
         .send(event)
-        .map_err(|_| -> Box<dyn Error> { "indexing pipeline disconnected".into() })
+        .map_err(|_| SearchxError::IndexingPipelineDisconnected)
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1069,7 +1107,7 @@ fn update_progress_manifest_entry(
     progress_manifest: Option<&ManifestWorkingSet>,
     relative_path: &str,
     entry: &ManifestEntry,
-) -> Result<(), Box<dyn Error>> {
+) -> SearchxResult<()> {
     if let Some(progress_manifest) = progress_manifest {
         progress_manifest.update_entry(relative_path, entry)?;
     }
@@ -1087,7 +1125,7 @@ fn report_scan_error(error_sender: Option<&mpsc::Sender<ScanError>>, error: Scan
 fn build_ignore_file(
     data_dir: &Path,
     ignore_rules: &[String],
-) -> Result<Option<NamedTempFile>, Box<dyn Error>> {
+) -> SearchxResult<Option<NamedTempFile>> {
     if ignore_rules.is_empty() {
         return Ok(None);
     }
@@ -1105,7 +1143,7 @@ fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {
     !entry.path().starts_with(data_dir)
 }
 
-fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, Box<dyn Error>> {
+fn normalize_relative_path(path: &Path, root: &Path) -> SearchxResult<String> {
     let relative = path.strip_prefix(root)?;
     Ok(relative
         .to_string_lossy()
@@ -1122,7 +1160,7 @@ pub fn apply_index_batch(
     temp_dir: &Path,
     upserts: &[String],
     deleted_ids: &[String],
-) -> Result<(), Box<dyn Error>> {
+) -> SearchxResult<()> {
     if upserts.is_empty() && deleted_ids.is_empty() {
         return Ok(());
     }
@@ -1179,7 +1217,7 @@ pub fn apply_index_batch(
     )?;
 
     if let Some(error) = operation_stats.into_iter().find_map(|stat| stat.error) {
-        return Err(Box::new(error));
+        return Err(milli::Error::from(error).into());
     }
 
     indexer::index(
@@ -1204,7 +1242,7 @@ pub fn apply_index_batch(
     Ok(())
 }
 
-pub fn commit_working_manifest(path: &Path, root: &Path) -> Result<(), Box<dyn Error>> {
+pub fn commit_working_manifest(path: &Path, root: &Path) -> SearchxResult<()> {
     let mut conn = open_manifest_connection(path)?;
     let tx = conn.transaction()?;
     tx.execute(
@@ -1228,7 +1266,7 @@ pub fn commit_working_manifest(path: &Path, root: &Path) -> Result<(), Box<dyn E
     Ok(())
 }
 
-pub fn discard_working_manifest(path: &Path) -> Result<(), Box<dyn Error>> {
+pub fn discard_working_manifest(path: &Path) -> SearchxResult<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -1328,7 +1366,7 @@ impl PendingIndexBatch {
 }
 
 fn cancel_scan_thread(
-    scan_handle: thread::JoinHandle<Result<SyncStats, String>>,
+    scan_handle: thread::JoinHandle<SearchxResult<SyncStats>>,
     cancel_flag: &AtomicBool,
     manifest_path: &Path,
 ) {
@@ -1338,18 +1376,16 @@ fn cancel_scan_thread(
 }
 
 fn finish_scan_thread(
-    scan_handle: thread::JoinHandle<Result<SyncStats, String>>,
+    scan_handle: thread::JoinHandle<SearchxResult<SyncStats>>,
     manifest_path: &Path,
 ) -> SearchxResult<SyncStats> {
     match scan_handle.join() {
-        Ok(Ok(summary)) => Ok(summary),
-        Ok(Err(error)) => {
-            discard_working_manifest_quietly(manifest_path);
-            Err(error.into())
-        }
+        Ok(result) => result.inspect_err(|_| discard_working_manifest_quietly(manifest_path)),
         Err(payload) => {
             discard_working_manifest_quietly(manifest_path);
-            Err(format!("scan thread panicked: {}", panic_message(payload.as_ref())).into())
+            Err(SearchxError::ScanThreadPanicked {
+                message: panic_message(payload.as_ref()),
+            })
         }
     }
 }
@@ -1406,7 +1442,6 @@ where
             Some(scan_hook_for_thread.as_ref()),
             &pipeline,
         )
-        .map_err(|error| error.to_string())
     });
 
     let mut last_reported_file = None;
@@ -1450,14 +1485,14 @@ where
     Ok(scan_result)
 }
 
-pub fn sync_index(request: &SyncRequest) -> Result<SyncIndexResult, Box<dyn Error>> {
+pub fn sync_index(request: &SyncRequest) -> SearchxResult<SyncIndexResult> {
     sync_index_with_progress(request, |_| {})
 }
 
 pub fn sync_index_with_progress<F>(
     request: &SyncRequest,
     mut on_progress: F,
-) -> Result<SyncIndexResult, Box<dyn Error>>
+) -> SearchxResult<SyncIndexResult>
 where
     F: FnMut(SyncProgress),
 {
@@ -1521,11 +1556,7 @@ where
     })
 }
 
-pub fn search_index(
-    index: &Index,
-    query: &str,
-    limit: usize,
-) -> Result<SearchResults, Box<dyn Error>> {
+pub fn search_index(index: &Index, query: &str, limit: usize) -> SearchxResult<SearchResults> {
     let rtxn = index.read_txn()?;
     let progress = Progress::default();
     let mut search = milli::Search::new(&rtxn, index, &progress);

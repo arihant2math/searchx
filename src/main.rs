@@ -1,10 +1,28 @@
 use searchx::{
-    DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, ScanOptions, SearchResults, SyncIndexResult,
-    SyncProgress, SyncRequest, search_index, sync_index_with_progress,
+    DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, ScanOptions, SearchResults, SearchxError,
+    SyncIndexResult, SyncProgress, SyncRequest, search_index, sync_index_with_progress,
 };
 use std::env;
-use std::error::Error;
 use std::path::PathBuf;
+use thiserror::Error;
+
+type CliResult<T> = Result<T, CliError>;
+
+#[derive(Debug, Error)]
+enum CliError {
+    #[error("{0}")]
+    Usage(String),
+    #[error("{0}")]
+    Argument(String),
+    #[error(transparent)]
+    Searchx(Box<SearchxError>),
+}
+
+impl From<SearchxError> for CliError {
+    fn from(error: SearchxError) -> Self {
+        Self::Searchx(Box::new(error))
+    }
+}
 
 struct CliOptions {
     root: PathBuf,
@@ -32,24 +50,24 @@ fn usage(program: &str) -> String {
     )
 }
 
-fn parse_u64_flag(flag: &str, value: &str) -> Result<u64, String> {
+fn parse_u64_flag(flag: &str, value: &str) -> CliResult<u64> {
     value
         .parse()
-        .map_err(|_| format!("invalid value for {flag}: {value}"))
+        .map_err(|_| CliError::Argument(format!("invalid value for {flag}: {value}")))
 }
 
-fn parse_usize_flag(flag: &str, value: &str) -> Result<usize, String> {
+fn parse_usize_flag(flag: &str, value: &str) -> CliResult<usize> {
     value
         .parse()
-        .map_err(|_| format!("invalid value for {flag}: {value}"))
+        .map_err(|_| CliError::Argument(format!("invalid value for {flag}: {value}")))
 }
 
-fn next_flag_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+fn next_flag_value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<String> {
     args.next()
-        .ok_or_else(|| format!("missing value for {flag}"))
+        .ok_or_else(|| CliError::Argument(format!("missing value for {flag}")))
 }
 
-fn parse_args() -> Result<Command, String> {
+fn parse_args() -> CliResult<Command> {
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "searchx".to_string());
     let mut args = args.peekable();
@@ -76,14 +94,17 @@ fn parse_args() -> Result<Command, String> {
             }
             "-r" | "--rebuild" => rebuild = true,
             _ if arg.starts_with('-') => {
-                return Err(format!("unknown option: {arg}\n\n{}", usage(&program)));
+                return Err(CliError::Argument(format!(
+                    "unknown option: {arg}\n\n{}",
+                    usage(&program)
+                )));
             }
             _ => positional.push(arg),
         }
     }
 
     match positional.as_slice() {
-        [] => Err(usage(&program)),
+        [] => Err(CliError::Usage(usage(&program))),
         [root] => Ok(Command::Run(CliOptions {
             root: PathBuf::from(root),
             query: None,
@@ -100,10 +121,10 @@ fn parse_args() -> Result<Command, String> {
             rebuild,
             limit,
         })),
-        _ => Err(format!(
+        _ => Err(CliError::Argument(format!(
             "too many positional arguments\n\n{}",
             usage(&program)
-        )),
+        ))),
     }
 }
 
@@ -146,14 +167,14 @@ fn print_search_results(results: &SearchResults) {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+fn run() -> CliResult<()> {
     let command = match parse_args() {
         Ok(command) => command,
-        Err(error) if error.starts_with("Usage:") => {
-            println!("{error}");
+        Err(CliError::Usage(help)) => {
+            println!("{help}");
             return Ok(());
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
 
     let cli = match command {
