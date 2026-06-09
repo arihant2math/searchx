@@ -42,6 +42,9 @@ fn open_existing_index(data_dir: &Path) -> SearchxResult<Index> {
 fn print_search_results(results: &SearchResults) {
     println!("Query: {}", results.query);
     println!("Found {} matching documents.", results.candidate_count);
+    for (timing, value) in &results.timings {
+        println!("{timing}: {value}");
+    }
 
     for hit in &results.hits {
         println!("{}. {}", hit.rank, hit.path);
