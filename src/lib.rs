@@ -28,35 +28,35 @@ pub const VECTOR_EMBEDDER_NAME: &str = "default";
 pub const VECTOR_DIMENSIONS: usize = 1536;
 const VECTOR_STORE_BACKEND: VectorStoreBackend = VectorStoreBackend::Arroy;
 const SEARCHABLE_FIELDS: [&str; 4] = ["file_name", "path", "contents", "extension"];
-const DEFAULT_IGNORED_DIRECTORIES: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-    ".cache",
-    "coverage",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
+const DEFAULT_IGNORE_RULES: &[&str] = &[
+    ".git/",
+    "node_modules/",
+    "target/",
+    "dist/",
+    "build/",
+    ".next/",
+    ".turbo/",
+    ".cache/",
+    "coverage/",
+    "__pycache__/",
+    ".venv/",
+    "venv/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
 ];
 
 #[derive(Debug)]
 pub struct ScanOptions {
     pub rebuild: bool,
     pub max_file_bytes: u64,
-    pub ignored_directories: BTreeSet<String>,
+    pub ignore_rules: Vec<String>,
 }
 
-pub fn default_ignored_directories() -> BTreeSet<String> {
-    DEFAULT_IGNORED_DIRECTORIES
+pub fn default_ignore_rules() -> Vec<String> {
+    DEFAULT_IGNORE_RULES
         .iter()
-        .map(|directory| (*directory).to_string())
+        .map(|rule| (*rule).to_string())
         .collect()
 }
 
@@ -331,11 +331,22 @@ pub fn scan_root(
     let mut stats = SyncStats::default();
     let mut updates_file = NamedTempFile::new_in(data_dir)?;
     let mut writer = BufWriter::new(updates_file.as_file_mut());
-    let data_dir = data_dir.to_path_buf();
-    let ignored_directories = options.ignored_directories.clone();
+    let mut walker_builder = WalkBuilder::new(root);
+    walker_builder
+        .hidden(false)
+        .require_git(false)
+        .current_dir(root);
 
-    let walker = WalkBuilder::new(root)
-        .filter_entry(move |entry| should_walk_entry(entry, &data_dir, &ignored_directories))
+    let custom_ignore_file = build_ignore_file(data_dir, &options.ignore_rules)?;
+    if let Some(ignore_file) = &custom_ignore_file
+        && let Some(error) = walker_builder.add_ignore(ignore_file.path())
+    {
+        return Err(Box::new(error));
+    }
+
+    let data_dir = data_dir.to_path_buf();
+    let walker = walker_builder
+        .filter_entry(move |entry| should_walk_entry(entry, &data_dir))
         .build();
 
     for result in walker {
@@ -515,28 +526,25 @@ fn handle_unsupported_file(
     );
 }
 
-fn should_walk_entry(
-    entry: &DirEntry,
+fn build_ignore_file(
     data_dir: &Path,
-    ignored_directories: &BTreeSet<String>,
-) -> bool {
-    if entry.path().starts_with(data_dir) {
-        return false;
+    ignore_rules: &[String],
+) -> Result<Option<NamedTempFile>, Box<dyn Error>> {
+    if ignore_rules.is_empty() {
+        return Ok(None);
     }
 
-    if entry
-        .file_type()
-        .is_some_and(|file_type| file_type.is_dir())
-        && let Some(name) = entry.file_name().to_str()
-    {
-        return !should_ignore_directory_name(name, ignored_directories);
+    let mut file = NamedTempFile::new_in(data_dir)?;
+    for rule in ignore_rules {
+        writeln!(file, "{rule}")?;
     }
+    file.as_file_mut().flush()?;
 
-    true
+    Ok(Some(file))
 }
 
-fn should_ignore_directory_name(name: &str, ignored_directories: &BTreeSet<String>) -> bool {
-    ignored_directories.contains(name)
+fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {
+    !entry.path().starts_with(data_dir)
 }
 
 fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, Box<dyn Error>> {
@@ -664,4 +672,83 @@ pub fn new_heed_options() -> EnvOpenOptions<WithoutTls> {
     let mut heed_options = milli::heed::EnvOpenOptions::new();
     heed_options.map_size(DEFAULT_MAP_SIZE_BYTES);
     heed_options.read_txn_without_tls()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    fn empty_manifest(root: &Path) -> Manifest {
+        Manifest {
+            version: MANIFEST_VERSION,
+            root: root.display().to_string(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    fn setup_scan_dirs() -> (TempDir, PathBuf, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("root");
+        let data_dir = temp_dir.path().join(".searchx-data");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        (temp_dir, root, data_dir)
+    }
+
+    fn indexed_paths(manifest: &Manifest) -> BTreeSet<String> {
+        manifest
+            .files
+            .iter()
+            .filter(|(_, entry)| entry.is_indexed())
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn scan_root_respects_gitignore_style_ignore_rules() {
+        let (_temp_dir, root, data_dir) = setup_scan_dirs();
+        fs::write(root.join("keep.log"), "keep me").unwrap();
+        fs::write(root.join("skip.log"), "skip me").unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join("build").join("artifact.txt"), "artifact").unwrap();
+
+        let options = ScanOptions {
+            rebuild: false,
+            max_file_bytes: u64::MAX,
+            ignore_rules: vec![
+                "*.log".to_string(),
+                "!keep.log".to_string(),
+                "build/".to_string(),
+            ],
+        };
+
+        let scan = scan_root(&options, &root, &data_dir, &empty_manifest(&root)).unwrap();
+        let indexed = indexed_paths(&scan.next_manifest);
+
+        assert_eq!(indexed, BTreeSet::from(["keep.log".to_string()]));
+    }
+
+    #[test]
+    fn scan_root_applies_dot_gitignore_rules_outside_git_repos() {
+        let (_temp_dir, root, data_dir) = setup_scan_dirs();
+        fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
+        fs::write(root.join("visible.txt"), "visible").unwrap();
+        fs::write(root.join("ignored.tmp"), "ignored").unwrap();
+        fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+
+        let options = ScanOptions {
+            rebuild: false,
+            max_file_bytes: u64::MAX,
+            ignore_rules: Vec::new(),
+        };
+
+        let scan = scan_root(&options, &root, &data_dir, &empty_manifest(&root)).unwrap();
+        let indexed = indexed_paths(&scan.next_manifest);
+
+        assert!(indexed.contains("visible.txt"));
+        assert!(indexed.contains(".env"));
+        assert!(!indexed.contains("ignored.tmp"));
+    }
 }

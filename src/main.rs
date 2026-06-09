@@ -2,7 +2,7 @@ use milli::update::IndexerConfig;
 use milli::{CreateOrOpen, Index};
 use searchx::{
     DataPaths, ScanOptions, SyncStats, apply_index_changes, configure_index, data_paths,
-    default_ignored_directories, load_manifest, new_heed_options, reset_data_dir, save_manifest,
+    default_ignore_rules, load_manifest, new_heed_options, reset_data_dir, save_manifest,
     scan_root, search_index,
 };
 use std::error::Error;
@@ -39,7 +39,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let options = ScanOptions {
         rebuild: false,
         max_file_bytes: 1024 * 1024 * 50,
-        ignored_directories: default_ignored_directories(),
+        ignore_rules: default_ignore_rules(),
     };
     let query = Some("Hi".to_string());
     let root = fs::canonicalize(DEFAULT_ROOT)?;
