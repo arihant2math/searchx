@@ -1,7 +1,5 @@
 use crate::constants::VECTOR_DIMENSIONS;
-#[cfg(not(test))]
-use crate::error::SearchxError;
-use crate::error::SearchxResult;
+use crate::error::{SearchxError, SearchxResult};
 #[cfg(not(test))]
 use fastembed::{
     EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions,
@@ -42,62 +40,93 @@ pub(crate) struct Embedder {
 
 impl Embedder {
     pub(crate) fn embed(&mut self, input: &OwnedEmbeddingInput) -> SearchxResult<Vec<f32>> {
+        match input {
+            OwnedEmbeddingInput::Text(text) => self
+                .embed_texts(&[text.as_str()])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SearchxError::Embedding {
+                    message: "text embedder returned no vectors".to_string(),
+                }),
+            OwnedEmbeddingInput::Image(bytes) => self
+                .embed_images(&[bytes.as_slice()])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SearchxError::Embedding {
+                    message: "image embedder returned no vectors".to_string(),
+                }),
+        }
+    }
+
+    pub(crate) fn embed_texts(&mut self, texts: &[&str]) -> SearchxResult<Vec<Vec<f32>>> {
         #[cfg(test)]
         {
-            let vector = match input {
-                OwnedEmbeddingInput::Text(text) => pseudo_embedding(text.as_bytes()),
-                OwnedEmbeddingInput::Image(bytes) => pseudo_embedding(bytes),
-            };
-            return Ok(vector);
+            return Ok(texts
+                .iter()
+                .map(|text| pseudo_embedding(text.as_bytes()))
+                .collect());
         }
 
         #[cfg(not(test))]
         {
-            let vector = match input {
-                OwnedEmbeddingInput::Text(text) => {
-                    let model = self.text_model.get_or_insert(text_embedding_model()?);
-                    let embeddings = model.embed(vec![text.as_str()], None).map_err(|error| {
-                        SearchxError::Embedding {
-                            message: error.to_string(),
-                        }
-                    })?;
-                    embeddings
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| SearchxError::Embedding {
-                            message: "text embedder returned no vectors".to_string(),
-                        })?
-                }
-                OwnedEmbeddingInput::Image(bytes) => {
-                    let model = self.image_model.get_or_insert(image_embedding_model()?);
-                    let embeddings =
-                        model
-                            .embed_bytes(&[bytes.as_slice()], None)
-                            .map_err(|error| SearchxError::Embedding {
-                                message: error.to_string(),
-                            })?;
-                    embeddings
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| SearchxError::Embedding {
-                            message: "image embedder returned no vectors".to_string(),
-                        })?
-                }
-            };
-
-            if vector.len() != VECTOR_DIMENSIONS {
-                return Err(SearchxError::Embedding {
-                    message: format!(
-                        "embedder returned {} dimensions, expected {}",
-                        vector.len(),
-                        VECTOR_DIMENSIONS
-                    ),
-                });
-            }
-
-            Ok(vector)
+            let model = self.text_model.get_or_insert(text_embedding_model()?);
+            let embeddings = model
+                .embed(texts, None)
+                .map_err(|error| SearchxError::Embedding {
+                    message: error.to_string(),
+                })?;
+            validate_embeddings(embeddings, texts.len())
         }
     }
+
+    pub(crate) fn embed_images(&mut self, images: &[&[u8]]) -> SearchxResult<Vec<Vec<f32>>> {
+        #[cfg(test)]
+        {
+            return Ok(images.iter().map(|bytes| pseudo_embedding(bytes)).collect());
+        }
+
+        #[cfg(not(test))]
+        {
+            let model = self.image_model.get_or_insert(image_embedding_model()?);
+            let embeddings =
+                model
+                    .embed_bytes(images, None)
+                    .map_err(|error| SearchxError::Embedding {
+                        message: error.to_string(),
+                    })?;
+            validate_embeddings(embeddings, images.len())
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn validate_embeddings(
+    embeddings: Vec<Vec<f32>>,
+    expected_len: usize,
+) -> SearchxResult<Vec<Vec<f32>>> {
+    if embeddings.len() != expected_len {
+        return Err(SearchxError::Embedding {
+            message: format!(
+                "embedder returned {} vectors, expected {}",
+                embeddings.len(),
+                expected_len
+            ),
+        });
+    }
+
+    for vector in &embeddings {
+        if vector.len() != VECTOR_DIMENSIONS {
+            return Err(SearchxError::Embedding {
+                message: format!(
+                    "embedder returned {} dimensions, expected {}",
+                    vector.len(),
+                    VECTOR_DIMENSIONS
+                ),
+            });
+        }
+    }
+
+    Ok(embeddings)
 }
 
 #[cfg(not(test))]

@@ -2,10 +2,11 @@ use crate::api::{
     ManifestLoad, ScanHook, ScanOptions, SyncIndexResult, SyncProgress, SyncRequest, SyncStats,
 };
 use crate::constants::{
-    EMBEDDING_JOB_CHANNEL_CAPACITY, INDEX_BATCH_BYTE_LIMIT, INDEX_BATCH_DELETE_LIMIT,
-    INDEX_BATCH_DOC_LIMIT, INDEX_EVENT_CHANNEL_CAPACITY, MANIFEST_BATCH_ENTRY_LIMIT,
-    PROGRESS_POLL_INTERVAL,
+    EMBEDDING_BATCH_DOC_LIMIT, EMBEDDING_JOB_CHANNEL_CAPACITY, INDEX_BATCH_BYTE_LIMIT,
+    INDEX_BATCH_DELETE_LIMIT, INDEX_BATCH_DOC_LIMIT, INDEX_EVENT_CHANNEL_CAPACITY,
+    MANIFEST_BATCH_ENTRY_LIMIT, PROGRESS_POLL_INTERVAL,
 };
+use crate::embedding::OwnedEmbeddingInput;
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{
     apply_index_batch, configure_index, document_id_for_path, embedded_document_vectors,
@@ -182,38 +183,177 @@ fn finish_embedding_thread(
     }
 }
 
+fn emit_embedded_document(
+    event_tx: &mpsc::SyncSender<IndexEvent>,
+    job: EmbeddingJob,
+    vector: Vec<f32>,
+) -> SearchxResult<()> {
+    let mut document = job.document;
+    let document_id = document.id.clone();
+    document.vectors = embedded_document_vectors(vector);
+    event_tx
+        .send(IndexEvent::Upsert {
+            document_id,
+            document: serde_json::to_string(&document)?,
+            progress: Some(job.progress),
+        })
+        .map_err(|_| SearchxError::IndexingPipelineDisconnected)
+}
+
+fn embed_text_jobs(
+    embedder: &mut crate::embedding::Embedder,
+    pending_jobs: &[EmbeddingJob],
+    vectors: &mut [Option<Vec<f32>>],
+) {
+    let mut text_indices = Vec::new();
+    let mut text_inputs = Vec::new();
+
+    for (index, job) in pending_jobs.iter().enumerate() {
+        if let OwnedEmbeddingInput::Text(text) = &job.input {
+            text_indices.push(index);
+            text_inputs.push(text.as_str());
+        }
+    }
+
+    if text_inputs.is_empty() {
+        return;
+    }
+
+    match embedder.embed_texts(&text_inputs) {
+        Ok(batch_vectors) => {
+            for (index, vector) in text_indices.into_iter().zip(batch_vectors) {
+                vectors[index] = Some(vector);
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "embedding batch error for {} text documents: {}",
+                text_inputs.len(),
+                error
+            );
+            for index in text_indices {
+                match embedder.embed(&pending_jobs[index].input) {
+                    Ok(vector) => vectors[index] = Some(vector),
+                    Err(error) => {
+                        eprintln!(
+                            "embedding error for {}: {}",
+                            pending_jobs[index].progress.path, error
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn embed_image_jobs(
+    embedder: &mut crate::embedding::Embedder,
+    pending_jobs: &[EmbeddingJob],
+    vectors: &mut [Option<Vec<f32>>],
+) {
+    let mut image_indices = Vec::new();
+    let mut image_inputs = Vec::new();
+
+    for (index, job) in pending_jobs.iter().enumerate() {
+        if let OwnedEmbeddingInput::Image(bytes) = &job.input {
+            image_indices.push(index);
+            image_inputs.push(bytes.as_slice());
+        }
+    }
+
+    if image_inputs.is_empty() {
+        return;
+    }
+
+    match embedder.embed_images(&image_inputs) {
+        Ok(batch_vectors) => {
+            for (index, vector) in image_indices.into_iter().zip(batch_vectors) {
+                vectors[index] = Some(vector);
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "embedding batch error for {} image documents: {}",
+                image_inputs.len(),
+                error
+            );
+            for index in image_indices {
+                match embedder.embed(&pending_jobs[index].input) {
+                    Ok(vector) => vectors[index] = Some(vector),
+                    Err(error) => {
+                        eprintln!(
+                            "embedding error for {}: {}",
+                            pending_jobs[index].progress.path, error
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn flush_embedding_jobs(
+    embedder: &mut crate::embedding::Embedder,
+    pending_jobs: &mut Vec<EmbeddingJob>,
+    event_tx: &mpsc::SyncSender<IndexEvent>,
+) -> SearchxResult<()> {
+    if pending_jobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut vectors = vec![None; pending_jobs.len()];
+    embed_text_jobs(embedder, pending_jobs, &mut vectors);
+    embed_image_jobs(embedder, pending_jobs, &mut vectors);
+
+    for (job, vector) in pending_jobs.drain(..).zip(vectors) {
+        if let Some(vector) = vector {
+            emit_embedded_document(event_tx, job, vector)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn run_embedding_thread(
     job_rx: mpsc::Receiver<EmbeddingJob>,
     event_tx: mpsc::SyncSender<IndexEvent>,
     cancel_flag: Arc<AtomicBool>,
 ) -> SearchxResult<()> {
     let mut embedder = crate::embedding::Embedder::default();
+    let mut pending_jobs = Vec::with_capacity(EMBEDDING_BATCH_DOC_LIMIT);
 
     loop {
         match job_rx.recv_timeout(PROGRESS_POLL_INTERVAL) {
-            Ok(job) => match embedder.embed(&job.input) {
-                Ok(vector) => {
-                    let mut document = job.document;
-                    let document_id = document.id.clone();
-                    document.vectors = embedded_document_vectors(vector);
-                    event_tx
-                        .send(IndexEvent::Upsert {
-                            document_id,
-                            document: serde_json::to_string(&document)?,
-                            progress: Some(job.progress),
-                        })
-                        .map_err(|_| SearchxError::IndexingPipelineDisconnected)?;
+            Ok(job) => {
+                pending_jobs.push(job);
+
+                let mut disconnected = false;
+                while pending_jobs.len() < EMBEDDING_BATCH_DOC_LIMIT {
+                    match job_rx.try_recv() {
+                        Ok(job) => pending_jobs.push(job),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
                 }
-                Err(error) => {
-                    eprintln!("embedding error for {}: {}", job.progress.path, error);
+
+                flush_embedding_jobs(&mut embedder, &mut pending_jobs, &event_tx)?;
+                if disconnected {
+                    return Ok(());
                 }
-            },
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                flush_embedding_jobs(&mut embedder, &mut pending_jobs, &event_tx)?;
                 if cancel_flag.load(Ordering::Relaxed) {
                     return Ok(());
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                flush_embedding_jobs(&mut embedder, &mut pending_jobs, &event_tx)?;
+                return Ok(());
+            }
         }
     }
 }
