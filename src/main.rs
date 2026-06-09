@@ -1,16 +1,18 @@
+use http_client::policy::IpPolicy;
+use milli::documents::{DocumentsBatchBuilder, DocumentsBatchReader};
+use milli::progress::{EmbedderStats, Progress};
+use milli::update::{IndexDocuments, IndexDocumentsConfig, IndexDocumentsMethod, IndexerConfig};
 use milli::{CreateOrOpen, Index};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use milli::documents::DocumentsBatchBuilder;
-use milli::heed::WithoutTls;
-use milli::progress::Progress;
+use std::io::Cursor;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Movie {
+struct File {
     id: u32,
-    title: String,
-    description: String,
+    path: String,
+    contents: String,
 }
 
 fn main() {
@@ -22,31 +24,52 @@ fn main() {
     let index = Index::new(options, dir.path(), CreateOrOpen::Create { shards: None }).unwrap();
 
     let movies = vec![
-        Movie {
+        File {
             id: 1,
-            title: String::from("The Matrix"),
-            description: String::from("A computer hacker learns about the true nature of his reality."),
+            path: String::from("test.txt"),
+            contents: String::from("I love ice cream"),
         },
-        Movie {
+        File {
             id: 2,
-            title: String::from("Inception"),
-            description: String::from("A thief who enters the dreams of others to steal secrets."),
+            path: String::from("test2.txt"),
+            contents: String::from("It is cold outside"),
         },
     ];
-    let batch_builder = DocumentsBatchBuilder::new(Vec::new());
+    let mut batch_builder = DocumentsBatchBuilder::new(Vec::new());
     for movie in movies {
-        batch_builder.append_json_object(serde_json::to_value(movie).unwrap().as_object().unwrap()).unwrap();
+        let value = serde_json::to_value(movie).unwrap();
+        batch_builder.append_json_object(value.as_object().unwrap()).unwrap();
     }
     let batch = batch_builder.into_inner().unwrap();
 
     let mut wtxn = index.write_txn().unwrap();
-    index.add_documents(&mut wtxn, batch_builder).unwrap();
+    let indexer_config = IndexerConfig::default();
+    let embedder_stats: Arc<EmbedderStats> = Default::default();
+    let reader = DocumentsBatchReader::from_reader(Cursor::new(batch)).unwrap();
+    let ip_policy = IpPolicy::danger_always_allow();
+    let index_documents = IndexDocuments::new(
+        &mut wtxn,
+        &index,
+        &indexer_config,
+        IndexDocumentsConfig {
+            update_method: IndexDocumentsMethod::ReplaceDocuments,
+            ..Default::default()
+        },
+        |_| {},
+        || false,
+        &embedder_stats,
+        &ip_policy,
+    )
+    .unwrap();
+    let (index_documents, indexed_count) = index_documents.add_documents(reader).unwrap();
+    println!("Indexed {} documents.", indexed_count.unwrap());
+    index_documents.execute().unwrap();
     wtxn.commit().unwrap();
 
     let rtxn = index.read_txn().unwrap();
     let progress = Progress::default();
     let mut search = milli::Search::new(&rtxn, &index, &progress);
-    search.query("Matrix");
+    search.query("cold");
     search.limit(10);
 
     let result = search.execute().unwrap();
