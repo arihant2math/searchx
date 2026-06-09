@@ -284,7 +284,7 @@ fn sync_repairs_orphaned_documents_after_incomplete_run() {
         file_name: "stale.txt".to_string(),
         extension: Some("txt".to_string()),
         contents: "stale".to_string(),
-        vectors: document_vectors("stale.txt", "stale"),
+        vectors: document_vectors(EmbeddingInput::Text("stale")),
     };
     apply_index_batch(
         &index,
@@ -318,12 +318,44 @@ fn sync_repairs_orphaned_documents_after_incomplete_run() {
 }
 
 #[test]
+fn sync_indexes_supported_images_without_marking_them_as_skipped_binary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().join("root");
+    let data_dir = temp_dir.path().join(".searchx-data");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("pixel.gif"),
+        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02L\x01\x00;",
+    )
+    .unwrap();
+
+    let result = sync_index(
+        &SyncRequest::new(&root)
+            .with_data_dir(&data_dir)
+            .with_options(ScanOptions {
+                max_file_bytes: u64::MAX,
+                ..ScanOptions::default()
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(result.stats.skipped_binary, 0);
+    assert_eq!(result.stats.indexed_or_updated, 1);
+
+    let image_results = search_index(&result.index, "pixel", 10).unwrap();
+    assert_eq!(image_results.candidate_count, 1);
+    assert_eq!(image_results.hits[0].path, "pixel.gif");
+    assert_eq!(image_results.hits[0].document["contents"], "");
+}
+
+#[test]
 fn sync_indexes_binary_and_oversized_files_by_name() {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().join("root");
     let data_dir = temp_dir.path().join(".searchx-data");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("archive.pdf"), [0, 1, 2, 3]).unwrap();
+    fs::write(root.join("blob.bin"), [0, 1, 2, 3]).unwrap();
     fs::write(root.join("recording.mp4"), vec![b'x'; 32]).unwrap();
 
     let result = sync_index(
@@ -338,12 +370,17 @@ fn sync_indexes_binary_and_oversized_files_by_name() {
 
     assert_eq!(result.stats.skipped_binary, 1);
     assert_eq!(result.stats.skipped_too_large, 1);
-    assert_eq!(result.stats.indexed_or_updated, 2);
+    assert_eq!(result.stats.indexed_or_updated, 3);
 
     let archive_results = search_index(&result.index, "archive", 10).unwrap();
     assert_eq!(archive_results.candidate_count, 1);
     assert_eq!(archive_results.hits[0].path, "archive.pdf");
     assert_eq!(archive_results.hits[0].document["contents"], "");
+
+    let blob_results = search_index(&result.index, "blob", 10).unwrap();
+    assert_eq!(blob_results.candidate_count, 1);
+    assert_eq!(blob_results.hits[0].path, "blob.bin");
+    assert_eq!(blob_results.hits[0].document["contents"], "");
 
     let recording_results = search_index(&result.index, "recording", 10).unwrap();
     assert_eq!(recording_results.candidate_count, 1);

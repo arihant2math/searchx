@@ -1,4 +1,5 @@
 use crate::api::{ScanError, ScanHook, ScanOptions, SyncStats};
+use crate::embedding::EmbeddingInput;
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{IndexedDocument, document_id_for_path, document_vectors};
 use crate::manifest::{FileFingerprint, FileState, Manifest, ManifestEntry, SkipReason};
@@ -174,6 +175,10 @@ impl<'a> ScanContext<'a> {
             return Ok(());
         };
 
+        if let Some(vector_input) = supported_binary_embedding_input(path, &bytes) {
+            return self.index_binary_document(&relative_path, path, fingerprint, vector_input);
+        }
+
         if bytes.contains(&0) {
             self.index_metadata_only_document(
                 &relative_path,
@@ -283,7 +288,24 @@ impl<'a> ScanContext<'a> {
             fingerprint,
             FileState::IndexedMetadata { reason },
             String::new(),
-            &embedding_text,
+            EmbeddingInput::Text(embedding_text.as_str()),
+        )
+    }
+
+    fn index_binary_document(
+        &mut self,
+        relative_path: &str,
+        path: &Path,
+        fingerprint: FileFingerprint,
+        vector_input: EmbeddingInput<'_>,
+    ) -> SearchxResult<()> {
+        self.upsert_document(
+            relative_path,
+            path,
+            fingerprint,
+            FileState::Indexed,
+            String::new(),
+            vector_input,
         )
     }
 
@@ -300,7 +322,7 @@ impl<'a> ScanContext<'a> {
             fingerprint,
             FileState::Indexed,
             contents.clone(),
-            &contents,
+            EmbeddingInput::Text(contents.as_str()),
         )
     }
 
@@ -311,9 +333,9 @@ impl<'a> ScanContext<'a> {
         fingerprint: FileFingerprint,
         state: FileState,
         contents: String,
-        vector_source: &str,
+        vector_input: EmbeddingInput<'_>,
     ) -> SearchxResult<()> {
-        let vectors = document_vectors(relative_path, vector_source);
+        let vectors = document_vectors(vector_input);
         let document = IndexedDocument {
             id: document_id_for_path(relative_path),
             path: relative_path.to_string(),
@@ -428,6 +450,26 @@ fn metadata_embedding_text(relative_path: &str, path: &Path) -> String {
     } else {
         format!("{relative_path}\n{file_name}\n{extension}")
     }
+}
+
+fn supported_binary_embedding_input<'a>(
+    path: &Path,
+    bytes: &'a [u8],
+) -> Option<EmbeddingInput<'a>> {
+    let extension = path.extension().and_then(OsStr::to_str)?;
+
+    if extension.eq_ignore_ascii_case("pdf") {
+        return Some(EmbeddingInput::Pdf(bytes));
+    }
+
+    if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        return Some(EmbeddingInput::Image(bytes));
+    }
+
+    None
 }
 
 fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {

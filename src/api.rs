@@ -1,10 +1,10 @@
 use crate::constants::{DEFAULT_DATA_DIR_NAME, DEFAULT_IGNORE_RULES, DEFAULT_MAX_FILE_BYTES};
 use crate::manifest::Manifest;
+use indexmap::IndexMap;
 use milli::Index;
 use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
-use indexmap::IndexMap;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {

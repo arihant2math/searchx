@@ -15,6 +15,7 @@ pub use api::{
 pub use constants::{
     DEFAULT_DATA_DIR_NAME, DEFAULT_MAX_FILE_BYTES, VECTOR_DIMENSIONS, VECTOR_EMBEDDER_NAME,
 };
+pub use embedding::EmbeddingInput;
 pub use error::{SearchxError, SearchxResult};
 pub use index::{
     apply_index_batch, configure_index, generate_document_vector, new_heed_options, search_index,

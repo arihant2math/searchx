@@ -3,6 +3,7 @@ use crate::constants::{
     DEFAULT_MAP_SIZE_BYTES, PRIMARY_KEY, SEARCHABLE_FIELDS, VECTOR_DIMENSIONS,
     VECTOR_EMBEDDER_NAME, VECTOR_STORE_BACKEND,
 };
+use crate::embedding::EmbeddingInput;
 use crate::error::SearchxResult;
 use bumpalo::Bump;
 use http_client::policy::IpPolicy;
@@ -18,7 +19,6 @@ use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use fastembed::{EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions, TextEmbedding};
 use tempfile::NamedTempFile;
 
 pub(crate) type IndexedVectors = BTreeMap<String, Option<Vec<f32>>>;
@@ -68,18 +68,22 @@ pub fn configure_index(index: &Index, indexer_config: &IndexerConfig) -> Searchx
 }
 
 #[must_use]
-pub fn generate_document_vector(relative_path: &str, contents: &str) -> Option<Vec<f32>> {
-    None
+pub fn generate_document_vector(input: EmbeddingInput<'_>) -> Option<Vec<f32>> {
+    match input {
+        EmbeddingInput::Text(_text) => None,
+        EmbeddingInput::Image(_bytes) => None,
+        EmbeddingInput::Pdf(_bytes) => None,
+    }
 }
 
 /// Get all vectors for a document, keyed by embedder name.
 ///
-/// Currently only supports one embedder, but this should be configurable
-pub(crate) fn document_vectors(relative_path: &str, contents: &str) -> IndexedVectors {
+/// Currently only supports one embedder, but this should be configurable.
+pub(crate) fn document_vectors(input: EmbeddingInput<'_>) -> IndexedVectors {
     let mut vectors = BTreeMap::new();
     vectors.insert(
         VECTOR_EMBEDDER_NAME.to_string(),
-        generate_document_vector(relative_path, contents),
+        generate_document_vector(input),
     );
     vectors
 }

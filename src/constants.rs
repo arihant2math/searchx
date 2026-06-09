@@ -1,7 +1,7 @@
 use milli::vector::VectorStoreBackend;
 use std::time::Duration;
 
-pub(crate) const MANIFEST_VERSION: u32 = 2;
+pub(crate) const MANIFEST_VERSION: u32 = 1;
 pub(crate) const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
 pub(crate) const INCOMPLETE_FILE_NAME: &str = "indexing-incomplete";
 pub(crate) const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;

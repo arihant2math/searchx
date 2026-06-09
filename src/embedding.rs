@@ -15,3 +15,10 @@ fn image_embedding_model() -> ImageEmbedding {
             .with_show_download_progress(true),
     ).unwrap()
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum EmbeddingInput<'a> {
+    Text(&'a str),
+    Image(&'a [u8]),
+    Pdf(&'a [u8]),
+}
