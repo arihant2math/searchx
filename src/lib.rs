@@ -11,7 +11,7 @@ use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
 use milli::{Index, all_obkv_to_json};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -19,12 +19,14 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.sqlite3";
+const INCOMPLETE_FILE_NAME: &str = "indexing-incomplete";
 const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const PRIMARY_KEY: &str = "id";
 pub const VECTOR_EMBEDDER_NAME: &str = "default";
@@ -68,6 +70,7 @@ pub struct DataPaths {
     pub base: PathBuf,
     pub index: PathBuf,
     pub manifest: PathBuf,
+    pub incomplete_marker: PathBuf,
 }
 
 #[derive(Debug)]
@@ -251,12 +254,17 @@ pub struct SyncStats {
 }
 
 #[derive(Debug)]
-pub struct ScanOutcome {
-    pub next_manifest: Manifest,
-    pub updates_file: NamedTempFile,
-    pub updated_count: usize,
-    pub deleted_ids: Vec<String>,
-    pub stats: SyncStats,
+pub enum IndexEvent {
+    Upsert(String),
+    Delete(String),
+}
+
+#[derive(Debug)]
+pub struct ScanPipeline {
+    pub progress_manifest_db: Option<PathBuf>,
+    pub error_sender: Option<mpsc::Sender<ScanError>>,
+    pub event_sender: mpsc::SyncSender<IndexEvent>,
+    pub cancel_flag: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -483,8 +491,22 @@ pub fn data_paths<P: AsRef<Path>>(data_dir: P) -> Result<DataPaths, Box<dyn Erro
     Ok(DataPaths {
         index: base.join("index"),
         manifest: base.join(MANIFEST_FILE_NAME),
+        incomplete_marker: base.join(INCOMPLETE_FILE_NAME),
         base,
     })
+}
+
+pub fn mark_index_incomplete(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(&data_paths.base)?;
+    fs::write(&data_paths.incomplete_marker, b"incomplete\n")?;
+    Ok(())
+}
+
+pub fn clear_index_incomplete(data_paths: &DataPaths) -> Result<(), Box<dyn Error>> {
+    if data_paths.incomplete_marker.exists() {
+        fs::remove_file(&data_paths.incomplete_marker)?;
+    }
+    Ok(())
 }
 
 pub fn load_manifest(
@@ -498,6 +520,13 @@ pub fn load_manifest(
         return Ok(ManifestLoad {
             manifest: empty_manifest,
             rebuild_reason: Some("forced by --rebuild".to_string()),
+        });
+    }
+
+    if data_paths.incomplete_marker.exists() {
+        return Ok(ManifestLoad {
+            manifest: empty_manifest,
+            rebuild_reason: Some("previous indexing run did not complete cleanly".to_string()),
         });
     }
 
@@ -639,15 +668,12 @@ pub fn scan_root(
     data_dir: &Path,
     previous: &Manifest,
     scan_hook: Option<Arc<ScanHook>>,
-    progress_manifest_db: Option<PathBuf>,
-    error_sender: Option<mpsc::Sender<ScanError>>,
-) -> Result<ScanOutcome, Box<dyn Error>> {
-    let mut next_manifest = Manifest::new(root);
-    let mut deleted_ids = BTreeSet::new();
+    pipeline: ScanPipeline,
+) -> Result<SyncStats, Box<dyn Error>> {
+    let mut seen_paths = HashSet::with_capacity(previous.files.len().saturating_mul(2));
     let mut stats = SyncStats::default();
-    let mut updates_file = NamedTempFile::new_in(data_dir)?;
-    let mut writer = BufWriter::new(updates_file.as_file_mut());
-    let progress_manifest = progress_manifest_db
+    let progress_manifest = pipeline
+        .progress_manifest_db
         .as_deref()
         .map(ManifestWorkingSet::open)
         .transpose()?;
@@ -671,11 +697,18 @@ pub fn scan_root(
         .build();
 
     for result in walker {
+        if pipeline.cancel_flag.load(Ordering::Relaxed) {
+            return Err("scan canceled".into());
+        }
+
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
                 stats.walk_errors += 1;
-                report_scan_error(error_sender.as_ref(), ScanError::walk(error.to_string()));
+                report_scan_error(
+                    pipeline.error_sender.as_ref(),
+                    ScanError::walk(error.to_string()),
+                );
                 continue;
             }
         };
@@ -689,6 +722,7 @@ pub fn scan_root(
 
         let path = entry.path();
         let relative_path = normalize_relative_path(path, root)?;
+        seen_paths.insert(relative_path.clone());
         if let Some(scan_hook) = scan_hook.as_ref() {
             scan_hook.set_current_file(relative_path.clone());
         }
@@ -699,13 +733,10 @@ pub fn scan_root(
             Err(error) => {
                 stats.read_errors += 1;
                 report_scan_error(
-                    error_sender.as_ref(),
+                    pipeline.error_sender.as_ref(),
                     ScanError::metadata(path.display().to_string(), error.to_string()),
                 );
                 if let Some(previous_entry) = previous.files.get(&relative_path) {
-                    next_manifest
-                        .files
-                        .insert(relative_path.clone(), previous_entry.clone());
                     update_progress_manifest_entry(
                         progress_manifest.as_ref(),
                         &relative_path,
@@ -720,9 +751,6 @@ pub fn scan_root(
         if let Some(previous_entry) = previous.files.get(&relative_path)
             && previous_entry.matches(fingerprint)
         {
-            next_manifest
-                .files
-                .insert(relative_path.clone(), previous_entry.clone());
             update_progress_manifest_entry(
                 progress_manifest.as_ref(),
                 &relative_path,
@@ -742,9 +770,9 @@ pub fn scan_root(
                 fingerprint,
                 SkipReason::TooLarge,
                 previous,
-                &mut next_manifest,
                 progress_manifest.as_ref(),
-                &mut deleted_ids,
+                &pipeline.event_sender,
+                &pipeline.cancel_flag,
                 &mut stats,
             )?;
             continue;
@@ -755,13 +783,10 @@ pub fn scan_root(
             Err(error) => {
                 stats.read_errors += 1;
                 report_scan_error(
-                    error_sender.as_ref(),
+                    pipeline.error_sender.as_ref(),
                     ScanError::read(path.display().to_string(), error.to_string()),
                 );
                 if let Some(previous_entry) = previous.files.get(&relative_path) {
-                    next_manifest
-                        .files
-                        .insert(relative_path.clone(), previous_entry.clone());
                     update_progress_manifest_entry(
                         progress_manifest.as_ref(),
                         &relative_path,
@@ -778,9 +803,9 @@ pub fn scan_root(
                 fingerprint,
                 SkipReason::Binary,
                 previous,
-                &mut next_manifest,
                 progress_manifest.as_ref(),
-                &mut deleted_ids,
+                &pipeline.event_sender,
+                &pipeline.cancel_flag,
                 &mut stats,
             )?;
             continue;
@@ -794,9 +819,9 @@ pub fn scan_root(
                     fingerprint,
                     SkipReason::Binary,
                     previous,
-                    &mut next_manifest,
                     progress_manifest.as_ref(),
-                    &mut deleted_ids,
+                    &pipeline.event_sender,
+                    &pipeline.cancel_flag,
                     &mut stats,
                 )?;
                 continue;
@@ -816,23 +841,23 @@ pub fn scan_root(
             contents,
             vectors,
         };
-
-        serde_json::to_writer(&mut writer, &document)?;
-        writer.write_all(b"\n")?;
         let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed);
-        next_manifest
-            .files
-            .insert(relative_path.clone(), entry.clone());
         update_progress_manifest_entry(progress_manifest.as_ref(), &relative_path, &entry)?;
+        send_index_event(
+            &pipeline.event_sender,
+            &pipeline.cancel_flag,
+            IndexEvent::Upsert(serde_json::to_string(&document)?),
+        )?;
         stats.indexed_or_updated += 1;
     }
 
-    writer.flush()?;
-    drop(writer);
-
     for (path, entry) in &previous.files {
-        if entry.is_indexed() && !next_manifest.files.contains_key(path) {
-            deleted_ids.insert(document_id_for_path(path));
+        if entry.is_indexed() && !seen_paths.contains(path) {
+            send_index_event(
+                &pipeline.event_sender,
+                &pipeline.cancel_flag,
+                IndexEvent::Delete(document_id_for_path(path)),
+            )?;
             stats.deleted_missing += 1;
         }
     }
@@ -841,23 +866,18 @@ pub fn scan_root(
         scan_hook.clear_current_file();
     }
 
-    Ok(ScanOutcome {
-        next_manifest,
-        updates_file,
-        updated_count: stats.indexed_or_updated as usize,
-        deleted_ids: deleted_ids.into_iter().collect(),
-        stats,
-    })
+    Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_unsupported_file(
     relative_path: &str,
     fingerprint: FileFingerprint,
     reason: SkipReason,
     previous: &Manifest,
-    next_manifest: &mut Manifest,
     progress_manifest: Option<&ManifestWorkingSet>,
-    deleted_ids: &mut BTreeSet<String>,
+    event_sender: &mpsc::SyncSender<IndexEvent>,
+    cancel_flag: &AtomicBool,
     stats: &mut SyncStats,
 ) -> Result<(), Box<dyn Error>> {
     match reason {
@@ -870,15 +890,30 @@ fn handle_unsupported_file(
         .get(relative_path)
         .is_some_and(ManifestEntry::is_indexed)
     {
-        deleted_ids.insert(document_id_for_path(relative_path));
+        send_index_event(
+            event_sender,
+            cancel_flag,
+            IndexEvent::Delete(document_id_for_path(relative_path)),
+        )?;
         stats.deleted_became_unsupported += 1;
     }
 
     let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
-    next_manifest
-        .files
-        .insert(relative_path.to_string(), entry.clone());
     update_progress_manifest_entry(progress_manifest, relative_path, &entry)
+}
+
+fn send_index_event(
+    event_sender: &mpsc::SyncSender<IndexEvent>,
+    cancel_flag: &AtomicBool,
+    event: IndexEvent,
+) -> Result<(), Box<dyn Error>> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err("indexing canceled".into());
+    }
+
+    event_sender
+        .send(event)
+        .map_err(|_| -> Box<dyn Error> { "indexing pipeline disconnected".into() })
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -936,13 +971,32 @@ fn document_id_for_path(relative_path: &str) -> String {
     blake3::hash(relative_path.as_bytes()).to_hex().to_string()
 }
 
-pub fn apply_index_changes(
+pub fn apply_index_batch(
     index: &Index,
     indexer_config: &IndexerConfig,
-    updates_file: &NamedTempFile,
-    updated_count: usize,
+    temp_dir: &Path,
+    upserts: &[String],
     deleted_ids: &[String],
 ) -> Result<(), Box<dyn Error>> {
+    if upserts.is_empty() && deleted_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut updates_file = if upserts.is_empty() {
+        None
+    } else {
+        let mut file = NamedTempFile::new_in(temp_dir)?;
+        {
+            let mut writer = BufWriter::new(file.as_file_mut());
+            for line in upserts {
+                writer.write_all(line.as_bytes())?;
+                writer.write_all(b"\n")?;
+            }
+            writer.flush()?;
+        }
+        Some(file)
+    };
+
     let mut wtxn = index.write_txn()?;
     let rtxn = index.read_txn()?;
     let db_fields_ids_map = index.fields_ids_map(&rtxn)?;
@@ -952,8 +1006,8 @@ pub fn apply_index_changes(
         .runtime_embedders;
 
     let mut operations = indexer::IndexOperations::new();
-    let mmap = if updated_count > 0 {
-        Some(unsafe { Mmap::map(updates_file.as_file())? })
+    let mmap = if let Some(file) = updates_file.as_ref() {
+        Some(unsafe { Mmap::map(file.as_file())? })
     } else {
         None
     };
@@ -999,6 +1053,8 @@ pub fn apply_index_changes(
         &EmbedderStats::default(),
     )?;
     wtxn.commit()?;
+    drop(mmap);
+    drop(updates_file.take());
 
     Ok(())
 }
@@ -1075,6 +1131,8 @@ pub fn new_heed_options() -> EnvOpenOptions<WithoutTls> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
     use tempfile::TempDir;
 
     fn empty_manifest(root: &Path) -> Manifest {
@@ -1094,12 +1152,36 @@ mod tests {
         (temp_dir, root, data_dir)
     }
 
-    fn indexed_paths(manifest: &Manifest) -> BTreeSet<String> {
-        manifest
-            .files
-            .iter()
-            .filter(|(_, entry)| entry.is_indexed())
-            .map(|(path, _)| path.clone())
+    fn streamed_indexed_paths(
+        options: &ScanOptions,
+        root: &Path,
+        data_dir: &Path,
+    ) -> BTreeSet<String> {
+        let (event_tx, event_rx) = mpsc::sync_channel(32);
+        scan_root(
+            options,
+            root,
+            data_dir,
+            &empty_manifest(root),
+            None,
+            ScanPipeline {
+                progress_manifest_db: None,
+                error_sender: None,
+                event_sender: event_tx,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .unwrap();
+
+        event_rx
+            .into_iter()
+            .filter_map(|event| match event {
+                IndexEvent::Upsert(document) => {
+                    let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+                    Some(value["path"].as_str().unwrap().to_string())
+                }
+                IndexEvent::Delete(_) => None,
+            })
             .collect()
     }
 
@@ -1121,17 +1203,7 @@ mod tests {
             ],
         };
 
-        let scan = scan_root(
-            &options,
-            &root,
-            &data_dir,
-            &empty_manifest(&root),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let indexed = indexed_paths(&scan.next_manifest);
+        let indexed = streamed_indexed_paths(&options, &root, &data_dir);
 
         assert_eq!(indexed, BTreeSet::from(["keep.log".to_string()]));
     }
@@ -1150,21 +1222,37 @@ mod tests {
             ignore_rules: Vec::new(),
         };
 
-        let scan = scan_root(
-            &options,
-            &root,
-            &data_dir,
-            &empty_manifest(&root),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let indexed = indexed_paths(&scan.next_manifest);
+        let indexed = streamed_indexed_paths(&options, &root, &data_dir);
 
         assert!(indexed.contains("visible.txt"));
         assert!(indexed.contains(".env"));
         assert!(!indexed.contains("ignored.tmp"));
+    }
+
+    #[test]
+    fn load_manifest_requests_rebuild_when_previous_run_was_incomplete() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("root");
+        let data_paths = DataPaths {
+            base: temp_dir.path().join(".searchx-data"),
+            index: temp_dir.path().join(".searchx-data").join("index"),
+            manifest: temp_dir
+                .path()
+                .join(".searchx-data")
+                .join(MANIFEST_FILE_NAME),
+            incomplete_marker: temp_dir
+                .path()
+                .join(".searchx-data")
+                .join(INCOMPLETE_FILE_NAME),
+        };
+        fs::create_dir_all(&root).unwrap();
+        mark_index_incomplete(&data_paths).unwrap();
+
+        let loaded = load_manifest(&data_paths, &root, false).unwrap();
+        assert_eq!(
+            loaded.rebuild_reason,
+            Some("previous indexing run did not complete cleanly".to_string())
+        );
     }
 
     #[test]
@@ -1176,6 +1264,7 @@ mod tests {
             base: base.clone(),
             index: base.join("index"),
             manifest: base.join(MANIFEST_FILE_NAME),
+            incomplete_marker: base.join(INCOMPLETE_FILE_NAME),
         };
         fs::create_dir_all(&root).unwrap();
 
