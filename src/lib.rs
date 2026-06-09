@@ -23,11 +23,36 @@ const MANIFEST_VERSION: u32 = 1;
 const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const PRIMARY_KEY: &str = "id";
 const SEARCHABLE_FIELDS: [&str; 4] = ["file_name", "path", "contents", "extension"];
+const DEFAULT_IGNORED_DIRECTORIES: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+];
 
 #[derive(Debug)]
 pub struct ScanOptions {
     pub rebuild: bool,
     pub max_file_bytes: u64,
+    pub ignored_directories: BTreeSet<String>,
+}
+
+pub fn default_ignored_directories() -> BTreeSet<String> {
+    DEFAULT_IGNORED_DIRECTORIES
+        .iter()
+        .map(|directory| (*directory).to_string())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -286,9 +311,10 @@ pub fn scan_root(
     let mut updates_file = NamedTempFile::new_in(data_dir)?;
     let mut writer = BufWriter::new(updates_file.as_file_mut());
     let data_dir = data_dir.to_path_buf();
+    let ignored_directories = options.ignored_directories.clone();
 
     let walker = WalkBuilder::new(root)
-        .filter_entry(move |entry| should_walk_entry(entry, &data_dir))
+        .filter_entry(move |entry| should_walk_entry(entry, &data_dir, &ignored_directories))
         .build();
 
     for result in walker {
@@ -466,7 +492,11 @@ fn handle_unsupported_file(
     );
 }
 
-fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {
+fn should_walk_entry(
+    entry: &DirEntry,
+    data_dir: &Path,
+    ignored_directories: &BTreeSet<String>,
+) -> bool {
     if entry.path().starts_with(data_dir) {
         return false;
     }
@@ -474,30 +504,16 @@ fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {
     if entry
         .file_type()
         .is_some_and(|file_type| file_type.is_dir())
+        && let Some(name) = entry.file_name().to_str()
     {
-        return !matches!(
-            entry.file_name().to_str(),
-            Some(
-                ".git"
-                    | "node_modules"
-                    | "target"
-                    | "dist"
-                    | "build"
-                    | ".next"
-                    | ".turbo"
-                    | ".cache"
-                    | "coverage"
-                    | "__pycache__"
-                    | ".venv"
-                    | "venv"
-                    | ".pytest_cache"
-                    | ".mypy_cache"
-                    | ".ruff_cache"
-            )
-        );
+        return !should_ignore_directory_name(name, ignored_directories);
     }
 
     true
+}
+
+fn should_ignore_directory_name(name: &str, ignored_directories: &BTreeSet<String>) -> bool {
+    ignored_directories.contains(name)
 }
 
 fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, Box<dyn Error>> {

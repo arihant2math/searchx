@@ -2,14 +2,15 @@ use milli::update::IndexerConfig;
 use milli::{CreateOrOpen, Index};
 use searchx::{
     DataPaths, ScanOptions, SyncStats, apply_index_changes, configure_index, data_paths,
-    load_manifest, new_heed_options, reset_data_dir, save_manifest, scan_root, search_index,
+    default_ignored_directories, load_manifest, new_heed_options, reset_data_dir,
+    save_manifest, scan_root, search_index,
 };
 use std::error::Error;
 use std::fs;
 use std::path::Path;
 
 const DATA_DIR_NAME: &str = ".searchx-data";
-const DEFAULT_ROOT: &str = "/Users/anaren/Documents/oss/memchr";
+const DEFAULT_ROOT: &str = "/Users/anaren/Downloads/";
 
 fn print_summary(root: &Path, data_paths: &DataPaths, stats: &SyncStats, max_file_bytes: u64) {
     println!("Indexed root: {}", root.display());
@@ -38,6 +39,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let options = ScanOptions {
         rebuild: false,
         max_file_bytes: 1024 * 1024 * 50,
+        ignored_directories: default_ignored_directories(),
     };
     let query = Some("Hi".to_string());
     let root = fs::canonicalize(DEFAULT_ROOT)?;
