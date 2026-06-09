@@ -161,7 +161,12 @@ impl<'a> ScanContext<'a> {
         }
 
         if metadata.len() > self.options.max_file_bytes {
-            self.mark_unsupported(&relative_path, fingerprint, SkipReason::TooLarge)?;
+            self.index_metadata_only_document(
+                &relative_path,
+                path,
+                fingerprint,
+                SkipReason::TooLarge,
+            )?;
             return Ok(());
         }
 
@@ -170,12 +175,22 @@ impl<'a> ScanContext<'a> {
         };
 
         if bytes.contains(&0) {
-            self.mark_unsupported(&relative_path, fingerprint, SkipReason::Binary)?;
+            self.index_metadata_only_document(
+                &relative_path,
+                path,
+                fingerprint,
+                SkipReason::Binary,
+            )?;
             return Ok(());
         }
 
         let Ok(contents) = String::from_utf8(bytes) else {
-            self.mark_unsupported(&relative_path, fingerprint, SkipReason::Binary)?;
+            self.index_metadata_only_document(
+                &relative_path,
+                path,
+                fingerprint,
+                SkipReason::Binary,
+            )?;
             return Ok(());
         };
 
@@ -239,7 +254,9 @@ impl<'a> ScanContext<'a> {
             relative_path,
             previous_entry,
         )?;
-        if previous_entry.is_indexed() {
+        if previous_entry.skips_contents() {
+            self.stats.unchanged_skipped += 1;
+        } else if previous_entry.is_indexed() {
             self.stats.unchanged_indexed += 1;
         } else {
             self.stats.unchanged_skipped += 1;
@@ -247,9 +264,10 @@ impl<'a> ScanContext<'a> {
         Ok(())
     }
 
-    fn mark_unsupported(
+    fn index_metadata_only_document(
         &mut self,
         relative_path: &str,
+        path: &Path,
         fingerprint: FileFingerprint,
         reason: SkipReason,
     ) -> SearchxResult<()> {
@@ -258,34 +276,14 @@ impl<'a> ScanContext<'a> {
             SkipReason::Binary => self.stats.skipped_binary += 1,
         }
 
-        let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
-        let progress = ProgressUpdate {
-            path: relative_path.to_string(),
-            entry,
-        };
-
-        if self
-            .previous
-            .files
-            .get(relative_path)
-            .is_some_and(ManifestEntry::is_indexed)
-        {
-            send_index_event(
-                self.event_sender,
-                self.cancel_flag,
-                IndexEvent::Delete {
-                    document_id: document_id_for_path(relative_path),
-                    progress: Some(progress),
-                },
-            )?;
-            self.stats.deleted_became_unsupported += 1;
-            return Ok(());
-        }
-
-        send_index_event(
-            self.event_sender,
-            self.cancel_flag,
-            IndexEvent::Progress(progress),
+        let embedding_text = metadata_embedding_text(relative_path, path);
+        self.upsert_document(
+            relative_path,
+            path,
+            fingerprint,
+            FileState::IndexedMetadata { reason },
+            String::new(),
+            &embedding_text,
         )
     }
 
@@ -296,7 +294,26 @@ impl<'a> ScanContext<'a> {
         fingerprint: FileFingerprint,
         contents: String,
     ) -> SearchxResult<()> {
-        let vectors = document_vectors(relative_path, &contents);
+        self.upsert_document(
+            relative_path,
+            path,
+            fingerprint,
+            FileState::Indexed,
+            contents.clone(),
+            &contents,
+        )
+    }
+
+    fn upsert_document(
+        &mut self,
+        relative_path: &str,
+        path: &Path,
+        fingerprint: FileFingerprint,
+        state: FileState,
+        contents: String,
+        vector_source: &str,
+    ) -> SearchxResult<()> {
+        let vectors = document_vectors(relative_path, vector_source);
         let document = IndexedDocument {
             id: document_id_for_path(relative_path),
             path: relative_path.to_string(),
@@ -309,7 +326,7 @@ impl<'a> ScanContext<'a> {
             contents,
             vectors,
         };
-        let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed);
+        let entry = ManifestEntry::from_fingerprint(fingerprint, state);
         send_index_event(
             self.event_sender,
             self.cancel_flag,
@@ -400,6 +417,17 @@ fn build_ignore_file(
     file.as_file_mut().flush()?;
 
     Ok(Some(file))
+}
+
+fn metadata_embedding_text(relative_path: &str, path: &Path) -> String {
+    let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    let extension = path.extension().and_then(OsStr::to_str).unwrap_or_default();
+
+    if extension.is_empty() {
+        format!("{relative_path}\n{file_name}")
+    } else {
+        format!("{relative_path}\n{file_name}\n{extension}")
+    }
 }
 
 fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {

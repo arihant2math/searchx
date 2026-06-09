@@ -39,11 +39,11 @@ fn print_summary(result: &SyncIndexResult, max_file_bytes: u64) {
         result.stats.unchanged_skipped
     );
     println!(
-        "Skipped oversized files (> {max_file_bytes} bytes): {}",
+        "Metadata-only files due to size limit (> {max_file_bytes} bytes): {}",
         result.stats.skipped_too_large
     );
     println!(
-        "Skipped binary/non-UTF8 files: {}",
+        "Metadata-only binary/non-UTF8 files: {}",
         result.stats.skipped_binary
     );
     println!("Read errors: {}", result.stats.read_errors);

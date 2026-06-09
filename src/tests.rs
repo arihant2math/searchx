@@ -97,6 +97,22 @@ fn scan_root_applies_dot_gitignore_rules_outside_git_repos() {
 }
 
 #[test]
+fn scan_root_still_indexes_binary_files_by_name() {
+    let (_temp_dir, root, data_dir) = setup_scan_dirs();
+    fs::write(root.join("archive.pdf"), [0, 1, 2, 3]).unwrap();
+
+    let options = ScanOptions {
+        rebuild: false,
+        max_file_bytes: u64::MAX,
+        ignore_rules: Vec::new(),
+    };
+
+    let indexed = streamed_indexed_paths(&options, &root, &data_dir);
+
+    assert!(indexed.contains("archive.pdf"));
+}
+
+#[test]
 fn load_manifest_resumes_from_working_state_when_previous_run_was_incomplete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().join("root");
@@ -299,4 +315,38 @@ fn sync_repairs_orphaned_documents_after_incomplete_run() {
     let live_results = search_index(&result.index, "live", 10).unwrap();
     assert_eq!(live_results.candidate_count, 1);
     assert_eq!(live_results.hits[0].path, "live.txt");
+}
+
+#[test]
+fn sync_indexes_binary_and_oversized_files_by_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().join("root");
+    let data_dir = temp_dir.path().join(".searchx-data");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("archive.pdf"), [0, 1, 2, 3]).unwrap();
+    fs::write(root.join("recording.mp4"), vec![b'x'; 32]).unwrap();
+
+    let result = sync_index(
+        &SyncRequest::new(&root)
+            .with_data_dir(&data_dir)
+            .with_options(ScanOptions {
+                max_file_bytes: 8,
+                ..ScanOptions::default()
+            }),
+    )
+    .unwrap();
+
+    assert_eq!(result.stats.skipped_binary, 1);
+    assert_eq!(result.stats.skipped_too_large, 1);
+    assert_eq!(result.stats.indexed_or_updated, 2);
+
+    let archive_results = search_index(&result.index, "archive", 10).unwrap();
+    assert_eq!(archive_results.candidate_count, 1);
+    assert_eq!(archive_results.hits[0].path, "archive.pdf");
+    assert_eq!(archive_results.hits[0].document["contents"], "");
+
+    let recording_results = search_index(&result.index, "recording", 10).unwrap();
+    assert_eq!(recording_results.candidate_count, 1);
+    assert_eq!(recording_results.hits[0].path, "recording.mp4");
+    assert_eq!(recording_results.hits[0].document["contents"], "");
 }

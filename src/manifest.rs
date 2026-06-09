@@ -27,6 +27,7 @@ pub(crate) struct ManifestEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileState {
     Indexed,
+    IndexedMetadata { reason: SkipReason },
     Skipped { reason: SkipReason },
 }
 
@@ -75,7 +76,17 @@ impl ManifestEntry {
     }
 
     pub(crate) fn is_indexed(&self) -> bool {
-        matches!(self.state, FileState::Indexed)
+        matches!(
+            self.state,
+            FileState::Indexed | FileState::IndexedMetadata { .. }
+        )
+    }
+
+    pub(crate) fn skips_contents(&self) -> bool {
+        matches!(
+            self.state,
+            FileState::IndexedMetadata { .. } | FileState::Skipped { .. }
+        )
     }
 }
 
@@ -304,6 +315,12 @@ pub(crate) fn load_working_manifest(
 fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
     match state {
         FileState::Indexed => ("indexed", None),
+        FileState::IndexedMetadata {
+            reason: SkipReason::TooLarge,
+        } => ("indexed", Some("too_large")),
+        FileState::IndexedMetadata {
+            reason: SkipReason::Binary,
+        } => ("indexed", Some("binary")),
         FileState::Skipped {
             reason: SkipReason::TooLarge,
         } => ("skipped", Some("too_large")),
@@ -316,14 +333,17 @@ fn file_state_to_db(state: &FileState) -> (&'static str, Option<&'static str>) {
 fn file_state_from_db(state: &str, skip_reason: Option<&str>) -> SearchxResult<FileState> {
     match (state, skip_reason) {
         ("indexed", None) => Ok(FileState::Indexed),
+        ("indexed", Some("too_large")) => Ok(FileState::IndexedMetadata {
+            reason: SkipReason::TooLarge,
+        }),
+        ("indexed", Some("binary")) => Ok(FileState::IndexedMetadata {
+            reason: SkipReason::Binary,
+        }),
         ("skipped", Some("too_large")) => Ok(FileState::Skipped {
             reason: SkipReason::TooLarge,
         }),
         ("skipped", Some("binary")) => Ok(FileState::Skipped {
             reason: SkipReason::Binary,
-        }),
-        ("indexed", Some(reason)) => Err(SearchxError::IndexedEntryWithSkipReason {
-            reason: reason.to_string(),
         }),
         ("skipped", None) => Err(SearchxError::MissingSkipReason),
         (state, reason) => Err(SearchxError::InvalidManifestState {
