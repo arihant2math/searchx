@@ -5,7 +5,9 @@ use memmap2::Mmap;
 use milli::heed::{EnvOpenOptions, WithoutTls};
 use milli::progress::{EmbedderStats, Progress};
 use milli::update::new::indexer;
-use milli::update::{IndexerConfig, MissingDocumentPolicy, Settings};
+use milli::update::{IndexerConfig, MissingDocumentPolicy, Setting, Settings};
+use milli::vector::VectorStoreBackend;
+use milli::vector::settings::{EmbedderSource, EmbeddingSettings};
 use milli::{Index, all_obkv_to_json};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +24,9 @@ use tempfile::NamedTempFile;
 const MANIFEST_VERSION: u32 = 1;
 const DEFAULT_MAP_SIZE_BYTES: usize = 10 * 1024 * 1024 * 1024;
 const PRIMARY_KEY: &str = "id";
+pub const VECTOR_EMBEDDER_NAME: &str = "default";
+pub const VECTOR_DIMENSIONS: usize = 1536;
+const VECTOR_STORE_BACKEND: VectorStoreBackend = VectorStoreBackend::Arroy;
 const SEARCHABLE_FIELDS: [&str; 4] = ["file_name", "path", "contents", "extension"];
 const DEFAULT_IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
@@ -96,6 +101,8 @@ struct FileFingerprint {
     modified_nanos: u32,
 }
 
+type IndexedVectors = BTreeMap<String, Option<Vec<f32>>>;
+
 #[derive(Serialize, Debug)]
 struct IndexedDocument {
     id: String,
@@ -103,6 +110,8 @@ struct IndexedDocument {
     file_name: String,
     extension: Option<String>,
     contents: String,
+    #[serde(rename = "_vectors")]
+    vectors: IndexedVectors,
 }
 
 #[derive(Debug, Default)]
@@ -267,23 +276,22 @@ pub fn configure_index(
         .map(|field| (*field).to_string())
         .collect::<Vec<_>>();
 
-    let rtxn = index.read_txn()?;
-    let current_primary_key = index.primary_key(&rtxn)?.map(str::to_string);
-    let current_searchable_fields = index
-        .user_defined_searchable_fields(&rtxn)?
-        .map(|fields| fields.into_iter().map(str::to_string).collect::<Vec<_>>());
-    drop(rtxn);
-
-    if current_primary_key.as_deref() == Some(PRIMARY_KEY)
-        && current_searchable_fields.as_deref() == Some(desired_searchable_fields.as_slice())
-    {
-        return Ok(());
-    }
+    let mut embedders = BTreeMap::new();
+    embedders.insert(
+        VECTOR_EMBEDDER_NAME.to_string(),
+        Setting::Set(EmbeddingSettings {
+            source: Setting::Set(EmbedderSource::UserProvided),
+            dimensions: Setting::Set(VECTOR_DIMENSIONS),
+            ..EmbeddingSettings::default()
+        }),
+    );
 
     let mut wtxn = index.write_txn()?;
     let mut settings = Settings::new(&mut wtxn, index, indexer_config);
     settings.set_primary_key(PRIMARY_KEY.to_string());
     settings.set_searchable_fields(desired_searchable_fields);
+    settings.set_embedder_settings(embedders);
+    settings.set_vector_store(VECTOR_STORE_BACKEND);
     settings.execute(
         &|| false,
         &Progress::default(),
@@ -293,6 +301,19 @@ pub fn configure_index(
     wtxn.commit()?;
 
     Ok(())
+}
+
+pub fn generate_document_vector(_relative_path: &str, _contents: &str) -> Option<Vec<f32>> {
+    None
+}
+
+fn document_vectors(relative_path: &str, contents: &str) -> IndexedVectors {
+    let mut vectors = BTreeMap::new();
+    vectors.insert(
+        VECTOR_EMBEDDER_NAME.to_string(),
+        generate_document_vector(relative_path, contents),
+    );
+    vectors
 }
 
 pub fn scan_root(
@@ -423,6 +444,7 @@ pub fn scan_root(
             }
         };
 
+        let vectors = document_vectors(&relative_path, &contents);
         let document = IndexedDocument {
             id: document_id_for_path(&relative_path),
             path: relative_path.clone(),
@@ -433,6 +455,7 @@ pub fn scan_root(
                 .to_string(),
             extension: path.extension().and_then(OsStr::to_str).map(str::to_string),
             contents,
+            vectors,
         };
 
         serde_json::to_writer(&mut writer, &document)?;
