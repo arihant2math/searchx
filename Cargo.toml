@@ -22,3 +22,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tempfile = "3.27.0"
 thiserror = "2.0.11"
+
+[profile.release]
+debug = true       # Preserves debug symbols for meaningful stack traces
+debug-assertions = false
+overflow-checks = false
