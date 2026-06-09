@@ -366,6 +366,8 @@ pub fn scan_root(
             continue;
         }
 
+        println!("walk entry: {entry:?}");
+
         let path = entry.path();
         let relative_path = normalize_relative_path(path, root)?;
         stats.scanned_files += 1;

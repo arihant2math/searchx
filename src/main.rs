@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 
 const DATA_DIR_NAME: &str = ".searchx-data";
-const DEFAULT_ROOT: &str = "/Users/anaren/Downloads/";
+const DEFAULT_ROOT: &str = "/Users/anaren/Documents/";
 
 fn print_summary(root: &Path, data_paths: &DataPaths, stats: &SyncStats, max_file_bytes: u64) {
     println!("Indexed root: {}", root.display());
