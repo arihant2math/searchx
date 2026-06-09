@@ -2,8 +2,8 @@ use milli::update::IndexerConfig;
 use milli::{CreateOrOpen, Index};
 use searchx::{
     DataPaths, ScanOptions, SyncStats, apply_index_changes, configure_index, data_paths,
-    default_ignored_directories, load_manifest, new_heed_options, reset_data_dir,
-    save_manifest, scan_root, search_index,
+    default_ignored_directories, load_manifest, new_heed_options, reset_data_dir, save_manifest,
+    scan_root, search_index,
 };
 use std::error::Error;
 use std::fs;
