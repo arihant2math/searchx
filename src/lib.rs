@@ -14,10 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
+use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 
@@ -46,7 +47,7 @@ const DEFAULT_IGNORE_RULES: &[&str] = &[
     ".ruff_cache/",
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub rebuild: bool,
     pub max_file_bytes: u64,
@@ -65,6 +66,125 @@ pub struct DataPaths {
     pub base: PathBuf,
     pub index: PathBuf,
     pub manifest: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct OptionalCell<T> {
+    value: Mutex<Option<T>>,
+}
+
+impl<T> Default for OptionalCell<T> {
+    fn default() -> Self {
+        Self {
+            value: Mutex::new(None),
+        }
+    }
+}
+
+impl<T> OptionalCell<T> {
+    pub fn new() -> Self {
+        Self {
+            value: Mutex::new(None),
+        }
+    }
+
+    pub fn set(&self, value: T) {
+        *lock_unpoisoned(&self.value) = Some(value);
+    }
+
+    pub fn clear(&self) {
+        *lock_unpoisoned(&self.value) = None;
+    }
+}
+
+impl<T: Clone> OptionalCell<T> {
+    pub fn get(&self) -> Option<T> {
+        lock_unpoisoned(&self.value).clone()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ScanHook {
+    current_file: OptionalCell<String>,
+}
+
+impl ScanHook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_current_file<S: Into<String>>(&self, path: S) {
+        self.current_file.set(path.into());
+    }
+
+    pub fn clear_current_file(&self) {
+        self.current_file.clear();
+    }
+
+    pub fn current_file(&self) -> Option<String> {
+        self.current_file.get()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ScanErrorKind {
+    Walk,
+    Metadata,
+    Read,
+}
+
+impl Display for ScanErrorKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Walk => "walk",
+            Self::Metadata => "metadata",
+            Self::Read => "read",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanError {
+    pub kind: ScanErrorKind,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+impl ScanError {
+    fn walk(message: impl Into<String>) -> Self {
+        Self {
+            kind: ScanErrorKind::Walk,
+            path: None,
+            message: message.into(),
+        }
+    }
+
+    fn metadata(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: ScanErrorKind::Metadata,
+            path: Some(path.into()),
+            message: message.into(),
+        }
+    }
+
+    fn read(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: ScanErrorKind::Read,
+            path: Some(path.into()),
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for ScanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(path) = &self.path {
+            write!(f, "{} error for {}: {}", self.kind, path, self.message)
+        } else {
+            write!(f, "{} error: {}", self.kind, self.message)
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -143,6 +263,16 @@ pub struct ManifestLoad {
     pub rebuild_reason: Option<String>,
 }
 
+impl Manifest {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            root: root.display().to_string(),
+            files: BTreeMap::new(),
+        }
+    }
+}
+
 impl ManifestEntry {
     fn from_fingerprint(fingerprint: FileFingerprint, state: FileState) -> Self {
         Self {
@@ -200,11 +330,7 @@ pub fn load_manifest(
     root: &Path,
     force_rebuild: bool,
 ) -> Result<ManifestLoad, Box<dyn Error>> {
-    let empty_manifest = Manifest {
-        version: MANIFEST_VERSION,
-        root: root.display().to_string(),
-        files: BTreeMap::new(),
-    };
+    let empty_manifest = Manifest::new(root);
 
     if force_rebuild {
         return Ok(ManifestLoad {
@@ -321,16 +447,17 @@ pub fn scan_root(
     root: &Path,
     data_dir: &Path,
     previous: &Manifest,
+    scan_hook: Option<Arc<ScanHook>>,
+    progress_manifest: Option<Arc<Mutex<Manifest>>>,
+    error_sender: Option<mpsc::Sender<ScanError>>,
 ) -> Result<ScanOutcome, Box<dyn Error>> {
-    let mut next_manifest = Manifest {
-        version: MANIFEST_VERSION,
-        root: root.display().to_string(),
-        files: BTreeMap::new(),
-    };
+    let mut next_manifest = Manifest::new(root);
     let mut deleted_ids = BTreeSet::new();
     let mut stats = SyncStats::default();
     let mut updates_file = NamedTempFile::new_in(data_dir)?;
     let mut writer = BufWriter::new(updates_file.as_file_mut());
+    initialize_progress_manifest(progress_manifest.as_ref(), root, previous);
+
     let mut walker_builder = WalkBuilder::new(root);
     walker_builder
         .hidden(false)
@@ -354,7 +481,7 @@ pub fn scan_root(
             Ok(entry) => entry,
             Err(error) => {
                 stats.walk_errors += 1;
-                eprintln!("walk error: {error}");
+                report_scan_error(error_sender.as_ref(), ScanError::walk(error.to_string()));
                 continue;
             }
         };
@@ -366,21 +493,30 @@ pub fn scan_root(
             continue;
         }
 
-        println!("walk entry: {entry:?}");
-
         let path = entry.path();
         let relative_path = normalize_relative_path(path, root)?;
+        if let Some(scan_hook) = scan_hook.as_ref() {
+            scan_hook.set_current_file(relative_path.clone());
+        }
         stats.scanned_files += 1;
 
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
                 stats.read_errors += 1;
-                eprintln!("metadata error for {}: {error}", path.display());
+                report_scan_error(
+                    error_sender.as_ref(),
+                    ScanError::metadata(path.display().to_string(), error.to_string()),
+                );
                 if let Some(previous_entry) = previous.files.get(&relative_path) {
                     next_manifest
                         .files
-                        .insert(relative_path, previous_entry.clone());
+                        .insert(relative_path.clone(), previous_entry.clone());
+                    update_progress_manifest_entry(
+                        progress_manifest.as_ref(),
+                        &relative_path,
+                        previous_entry,
+                    );
                 }
                 continue;
             }
@@ -393,6 +529,11 @@ pub fn scan_root(
             next_manifest
                 .files
                 .insert(relative_path.clone(), previous_entry.clone());
+            update_progress_manifest_entry(
+                progress_manifest.as_ref(),
+                &relative_path,
+                previous_entry,
+            );
             if previous_entry.is_indexed() {
                 stats.unchanged_indexed += 1;
             } else {
@@ -408,6 +549,7 @@ pub fn scan_root(
                 SkipReason::TooLarge,
                 previous,
                 &mut next_manifest,
+                progress_manifest.as_ref(),
                 &mut deleted_ids,
                 &mut stats,
             );
@@ -418,11 +560,19 @@ pub fn scan_root(
             Ok(bytes) => bytes,
             Err(error) => {
                 stats.read_errors += 1;
-                eprintln!("read error for {}: {error}", path.display());
+                report_scan_error(
+                    error_sender.as_ref(),
+                    ScanError::read(path.display().to_string(), error.to_string()),
+                );
                 if let Some(previous_entry) = previous.files.get(&relative_path) {
                     next_manifest
                         .files
-                        .insert(relative_path, previous_entry.clone());
+                        .insert(relative_path.clone(), previous_entry.clone());
+                    update_progress_manifest_entry(
+                        progress_manifest.as_ref(),
+                        &relative_path,
+                        previous_entry,
+                    );
                 }
                 continue;
             }
@@ -435,6 +585,7 @@ pub fn scan_root(
                 SkipReason::Binary,
                 previous,
                 &mut next_manifest,
+                progress_manifest.as_ref(),
                 &mut deleted_ids,
                 &mut stats,
             );
@@ -450,6 +601,7 @@ pub fn scan_root(
                     SkipReason::Binary,
                     previous,
                     &mut next_manifest,
+                    progress_manifest.as_ref(),
                     &mut deleted_ids,
                     &mut stats,
                 );
@@ -473,10 +625,11 @@ pub fn scan_root(
 
         serde_json::to_writer(&mut writer, &document)?;
         writer.write_all(b"\n")?;
-        next_manifest.files.insert(
-            relative_path,
-            ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed),
-        );
+        let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Indexed);
+        next_manifest
+            .files
+            .insert(relative_path.clone(), entry.clone());
+        update_progress_manifest_entry(progress_manifest.as_ref(), &relative_path, &entry);
         stats.indexed_or_updated += 1;
     }
 
@@ -488,6 +641,11 @@ pub fn scan_root(
             deleted_ids.insert(document_id_for_path(path));
             stats.deleted_missing += 1;
         }
+    }
+
+    replace_progress_manifest(progress_manifest.as_ref(), &next_manifest);
+    if let Some(scan_hook) = scan_hook.as_ref() {
+        scan_hook.clear_current_file();
     }
 
     Ok(ScanOutcome {
@@ -505,6 +663,7 @@ fn handle_unsupported_file(
     reason: SkipReason,
     previous: &Manifest,
     next_manifest: &mut Manifest,
+    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
     deleted_ids: &mut BTreeSet<String>,
     stats: &mut SyncStats,
 ) {
@@ -522,10 +681,57 @@ fn handle_unsupported_file(
         stats.deleted_became_unsupported += 1;
     }
 
-    next_manifest.files.insert(
-        relative_path.to_string(),
-        ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason }),
-    );
+    let entry = ManifestEntry::from_fingerprint(fingerprint, FileState::Skipped { reason });
+    next_manifest
+        .files
+        .insert(relative_path.to_string(), entry.clone());
+    update_progress_manifest_entry(progress_manifest, relative_path, &entry);
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn initialize_progress_manifest(
+    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
+    root: &Path,
+    previous: &Manifest,
+) {
+    if let Some(progress_manifest) = progress_manifest {
+        let mut manifest = lock_unpoisoned(progress_manifest);
+        *manifest = previous.clone();
+        manifest.version = MANIFEST_VERSION;
+        manifest.root = root.display().to_string();
+    }
+}
+
+fn update_progress_manifest_entry(
+    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
+    relative_path: &str,
+    entry: &ManifestEntry,
+) {
+    if let Some(progress_manifest) = progress_manifest {
+        lock_unpoisoned(progress_manifest)
+            .files
+            .insert(relative_path.to_string(), entry.clone());
+    }
+}
+
+fn replace_progress_manifest(
+    progress_manifest: Option<&Arc<Mutex<Manifest>>>,
+    manifest: &Manifest,
+) {
+    if let Some(progress_manifest) = progress_manifest {
+        *lock_unpoisoned(progress_manifest) = manifest.clone();
+    }
+}
+
+fn report_scan_error(error_sender: Option<&mpsc::Sender<ScanError>>, error: ScanError) {
+    if let Some(error_sender) = error_sender {
+        let _ = error_sender.send(error);
+    } else {
+        eprintln!("{error}");
+    }
 }
 
 fn build_ignore_file(
@@ -726,7 +932,16 @@ mod tests {
             ],
         };
 
-        let scan = scan_root(&options, &root, &data_dir, &empty_manifest(&root)).unwrap();
+        let scan = scan_root(
+            &options,
+            &root,
+            &data_dir,
+            &empty_manifest(&root),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let indexed = indexed_paths(&scan.next_manifest);
 
         assert_eq!(indexed, BTreeSet::from(["keep.log".to_string()]));
@@ -746,7 +961,16 @@ mod tests {
             ignore_rules: Vec::new(),
         };
 
-        let scan = scan_root(&options, &root, &data_dir, &empty_manifest(&root)).unwrap();
+        let scan = scan_root(
+            &options,
+            &root,
+            &data_dir,
+            &empty_manifest(&root),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let indexed = indexed_paths(&scan.next_manifest);
 
         assert!(indexed.contains("visible.txt"));
