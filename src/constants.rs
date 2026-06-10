@@ -16,6 +16,7 @@ pub(crate) const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const INDEX_EVENT_CHANNEL_CAPACITY: usize = 64;
 pub(crate) const EMBEDDING_JOB_CHANNEL_CAPACITY: usize = 64;
 pub(crate) const EMBEDDING_BATCH_DOC_LIMIT: usize = 32;
+pub(crate) const EMBEDDING_MAX_WORKERS: usize = 2;
 pub(crate) const INDEX_BATCH_DOC_LIMIT: usize = 128;
 pub(crate) const INDEX_BATCH_DELETE_LIMIT: usize = 512;
 pub(crate) const INDEX_BATCH_BYTE_LIMIT: usize = 8 * 1024 * 1024;

@@ -2,9 +2,9 @@ use crate::api::{
     ManifestLoad, ScanHook, ScanOptions, SyncIndexResult, SyncProgress, SyncRequest, SyncStats,
 };
 use crate::constants::{
-    EMBEDDING_BATCH_DOC_LIMIT, EMBEDDING_JOB_CHANNEL_CAPACITY, INDEX_BATCH_BYTE_LIMIT,
-    INDEX_BATCH_DELETE_LIMIT, INDEX_BATCH_DOC_LIMIT, INDEX_EVENT_CHANNEL_CAPACITY,
-    MANIFEST_BATCH_ENTRY_LIMIT, PROGRESS_POLL_INTERVAL,
+    EMBEDDING_BATCH_DOC_LIMIT, EMBEDDING_JOB_CHANNEL_CAPACITY, EMBEDDING_MAX_WORKERS,
+    INDEX_BATCH_BYTE_LIMIT, INDEX_BATCH_DELETE_LIMIT, INDEX_BATCH_DOC_LIMIT,
+    INDEX_EVENT_CHANNEL_CAPACITY, MANIFEST_BATCH_ENTRY_LIMIT, PROGRESS_POLL_INTERVAL,
 };
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 #[derive(Default)]
@@ -196,14 +196,110 @@ fn finish_scan_thread(
     }
 }
 
-fn finish_embedding_thread(
-    embedding_handle: thread::JoinHandle<SearchxResult<()>>,
-) -> SearchxResult<()> {
-    match embedding_handle.join() {
-        Ok(result) => result,
-        Err(payload) => Err(SearchxError::EmbeddingThreadPanicked {
-            message: panic_message(payload.as_ref()),
-        }),
+struct EmbeddingWorkerHandle {
+    name: String,
+    handle: thread::JoinHandle<SearchxResult<()>>,
+}
+
+enum ReceivedEmbeddingJobs {
+    Jobs {
+        pending_jobs: Vec<EmbeddingJob>,
+        disconnected: bool,
+    },
+    Timeout,
+    Disconnected,
+}
+
+fn finish_embedding_workers(embedding_handles: Vec<EmbeddingWorkerHandle>) -> SearchxResult<()> {
+    let mut first_error = None;
+    let mut panic_error = None;
+
+    for EmbeddingWorkerHandle { name, handle } in embedding_handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(payload) => {
+                if panic_error.is_none() {
+                    panic_error = Some(SearchxError::EmbeddingThreadPanicked {
+                        message: format!("{name}: {}", panic_message(payload.as_ref())),
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(error) = panic_error {
+        Err(error)
+    } else if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn embedding_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(EMBEDDING_MAX_WORKERS))
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn spawn_embedding_workers(
+    job_rx: Arc<Mutex<mpsc::Receiver<EmbeddingJob>>>,
+    event_tx: &mpsc::SyncSender<IndexEvent>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> SearchxResult<Vec<EmbeddingWorkerHandle>> {
+    let worker_count = embedding_worker_count();
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for worker_index in 0..worker_count {
+        let name = format!("Embedding Worker {}", worker_index + 1);
+        let worker_job_rx = Arc::clone(&job_rx);
+        let worker_event_tx = event_tx.clone();
+        let worker_cancel_flag = Arc::clone(cancel_flag);
+        let handle = thread::Builder::new().name(name.clone()).spawn(move || {
+            run_embedding_worker(worker_job_rx, worker_event_tx, worker_cancel_flag)
+        })?;
+        handles.push(EmbeddingWorkerHandle { name, handle });
+    }
+
+    Ok(handles)
+}
+
+fn receive_embedding_jobs(job_rx: &Mutex<mpsc::Receiver<EmbeddingJob>>) -> ReceivedEmbeddingJobs {
+    let mut pending_jobs = Vec::with_capacity(EMBEDDING_BATCH_DOC_LIMIT);
+    let receiver = match job_rx.lock() {
+        Ok(receiver) => receiver,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    match receiver.recv_timeout(PROGRESS_POLL_INTERVAL) {
+        Ok(job) => {
+            pending_jobs.push(job);
+
+            let mut disconnected = false;
+            while pending_jobs.len() < EMBEDDING_BATCH_DOC_LIMIT {
+                match receiver.try_recv() {
+                    Ok(job) => pending_jobs.push(job),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            ReceivedEmbeddingJobs::Jobs {
+                pending_jobs,
+                disconnected,
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => ReceivedEmbeddingJobs::Timeout,
+        Err(mpsc::RecvTimeoutError::Disconnected) => ReceivedEmbeddingJobs::Disconnected,
     }
 }
 
@@ -380,46 +476,30 @@ fn flush_embedding_jobs(
     Ok(())
 }
 
-fn run_embedding_thread(
-    job_rx: mpsc::Receiver<EmbeddingJob>,
+fn run_embedding_worker(
+    job_rx: Arc<Mutex<mpsc::Receiver<EmbeddingJob>>>,
     event_tx: mpsc::SyncSender<IndexEvent>,
     cancel_flag: Arc<AtomicBool>,
 ) -> SearchxResult<()> {
     let mut embedder = crate::embedding::Embedder::default();
-    let mut pending_jobs = Vec::with_capacity(EMBEDDING_BATCH_DOC_LIMIT);
 
     loop {
-        match job_rx.recv_timeout(PROGRESS_POLL_INTERVAL) {
-            Ok(job) => {
-                pending_jobs.push(job);
-
-                let mut disconnected = false;
-                while pending_jobs.len() < EMBEDDING_BATCH_DOC_LIMIT {
-                    match job_rx.try_recv() {
-                        Ok(job) => pending_jobs.push(job),
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                }
-
+        match receive_embedding_jobs(job_rx.as_ref()) {
+            ReceivedEmbeddingJobs::Jobs {
+                mut pending_jobs,
+                disconnected,
+            } => {
                 flush_embedding_jobs(&mut embedder, &mut pending_jobs, &event_tx)?;
                 if disconnected {
                     return Ok(());
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                flush_embedding_jobs(&mut embedder, &mut pending_jobs, &event_tx)?;
+            ReceivedEmbeddingJobs::Timeout => {
                 if cancel_flag.load(Ordering::Relaxed) {
                     return Ok(());
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                flush_embedding_jobs(&mut embedder, &mut pending_jobs, &event_tx)?;
-                return Ok(());
-            }
+            ReceivedEmbeddingJobs::Disconnected => return Ok(()),
         }
     }
 }
@@ -509,19 +589,11 @@ where
     let scan_data_dir = data_paths.base.clone();
     let scan_hook_for_thread = Arc::clone(scan_hook);
     let cancel_flag_for_thread = Arc::clone(&cancel_flag);
-    let cancel_flag_for_embedding = Arc::clone(&cancel_flag);
-    let embedding_event_tx = event_tx.clone();
+    let shared_embedding_job_rx = Arc::new(Mutex::new(embedding_job_rx));
     let (scan_error_tx, scan_error_rx) = mpsc::channel();
 
-    let embedding_handle = thread::Builder::new()
-        .name("Embedding Thread".to_string())
-        .spawn(move || {
-            run_embedding_thread(
-                embedding_job_rx,
-                embedding_event_tx,
-                cancel_flag_for_embedding,
-            )
-        })?;
+    let embedding_handles =
+        spawn_embedding_workers(shared_embedding_job_rx, &event_tx, &cancel_flag)?;
 
     let scan_handle = thread::Builder::new()
         .name("Scan Thread".to_string())
@@ -564,7 +636,7 @@ where
                     cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
                     let _ = finish_scan_thread(scan_handle);
-                    let _ = finish_embedding_thread(embedding_handle);
+                    let _ = finish_embedding_workers(embedding_handles);
                     return Err(error);
                 }
             }
@@ -578,13 +650,13 @@ where
                     cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
                     let _ = finish_scan_thread(scan_handle);
-                    let _ = finish_embedding_thread(embedding_handle);
+                    let _ = finish_embedding_workers(embedding_handles);
                     return Err(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let scan_result = finish_scan_thread(scan_handle);
-                let embedding_result = finish_embedding_thread(embedding_handle);
+                let embedding_result = finish_embedding_workers(embedding_handles);
                 break match (scan_result, embedding_result) {
                     (Err(error), _) => Err(error),
                     (Ok(_), Err(error)) => Err(error),
