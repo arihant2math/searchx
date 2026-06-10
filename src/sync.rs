@@ -80,7 +80,7 @@ impl PendingIndexBatch {
         &mut self,
         index: &Index,
         indexer_config: &IndexerConfig,
-        progress_manifest: Option<&ManifestWorkingSet>,
+        progress_manifest: Option<&mut ManifestWorkingSet>,
         data_paths: &crate::api::DataPaths,
     ) -> SearchxResult<()> {
         if self.upserts.is_empty()
@@ -427,7 +427,7 @@ where
         resume_existing_progress,
     } = job;
 
-    let progress_manifest =
+    let mut progress_manifest =
         ManifestWorkingSet::open(&data_paths.manifest, root, resume_existing_progress)?;
     let (event_tx, event_rx) = mpsc::sync_channel(INDEX_EVENT_CHANNEL_CAPACITY);
     let (embedding_job_tx, embedding_job_rx) = mpsc::sync_channel(EMBEDDING_JOB_CHANNEL_CAPACITY);
@@ -485,7 +485,7 @@ where
                     && let Err(error) = pending_batch.flush(
                         index,
                         indexer_config,
-                        Some(&progress_manifest),
+                        Some(&mut progress_manifest),
                         data_paths,
                     )
                 {
@@ -498,7 +498,7 @@ where
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(error) =
-                    pending_batch.flush(index, indexer_config, Some(&progress_manifest), data_paths)
+                    pending_batch.flush(index, indexer_config, Some(&mut progress_manifest), data_paths)
                 {
                     cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
@@ -521,7 +521,7 @@ where
 
     drain_scan_errors(&scan_error_rx, on_progress);
 
-    pending_batch.flush(index, indexer_config, Some(&progress_manifest), data_paths)?;
+    pending_batch.flush(index, indexer_config, Some(&mut progress_manifest), data_paths)?;
 
     Ok(scan_result)
 }

@@ -132,43 +132,81 @@ impl ManifestWorkingSet {
         Ok(Self { conn })
     }
 
+    #[cfg(test)]
     pub(crate) fn update_entry(
         &self,
         relative_path: &str,
         entry: &ManifestEntry,
     ) -> SearchxResult<()> {
-        let (state, skip_reason) = file_state_to_db(&entry.state);
-        self.conn.execute(
-            "INSERT INTO working_manifest_files \
-                (path, size, modified_secs, modified_nanos, state, skip_reason) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(path) DO UPDATE SET
-                size = excluded.size,
-                modified_secs = excluded.modified_secs,
-                modified_nanos = excluded.modified_nanos,
-                state = excluded.state,
-                skip_reason = excluded.skip_reason",
-            params![
-                relative_path,
-                i64_from_u64(entry.size, "size")?,
-                i64_from_u64(entry.modified_secs, "modified_secs")?,
-                i64::from(entry.modified_nanos),
-                state,
-                skip_reason,
-            ],
-        )?;
-        Ok(())
+        apply_manifest_entry_update(&self.conn, relative_path, entry)
     }
 
     pub(crate) fn update_entries(
-        &self,
+        &mut self,
         updates: &[crate::scan::ProgressUpdate],
     ) -> SearchxResult<()> {
-        for update in updates {
-            self.update_entry(&update.path, &update.entry)?;
+        if updates.is_empty() {
+            return Ok(());
         }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO working_manifest_files \
+                    (path, size, modified_secs, modified_nanos, state, skip_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(path) DO UPDATE SET
+                    size = excluded.size,
+                    modified_secs = excluded.modified_secs,
+                    modified_nanos = excluded.modified_nanos,
+                    state = excluded.state,
+                    skip_reason = excluded.skip_reason",
+            )?;
+
+            for update in updates {
+                let (state, skip_reason) = file_state_to_db(&update.entry.state);
+                statement.execute(params![
+                    update.path,
+                    i64_from_u64(update.entry.size, "size")?,
+                    i64_from_u64(update.entry.modified_secs, "modified_secs")?,
+                    i64::from(update.entry.modified_nanos),
+                    state,
+                    skip_reason,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn apply_manifest_entry_update(
+    conn: &Connection,
+    relative_path: &str,
+    entry: &ManifestEntry,
+) -> SearchxResult<()> {
+    let (state, skip_reason) = file_state_to_db(&entry.state);
+    conn.execute(
+        "INSERT INTO working_manifest_files \
+            (path, size, modified_secs, modified_nanos, state, skip_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(path) DO UPDATE SET
+            size = excluded.size,
+            modified_secs = excluded.modified_secs,
+            modified_nanos = excluded.modified_nanos,
+            state = excluded.state,
+            skip_reason = excluded.skip_reason",
+        params![
+            relative_path,
+            i64_from_u64(entry.size, "size")?,
+            i64_from_u64(entry.modified_secs, "modified_secs")?,
+            i64::from(entry.modified_nanos),
+            state,
+            skip_reason,
+        ],
+    )?;
+    Ok(())
 }
 
 enum StoredManifestState {
