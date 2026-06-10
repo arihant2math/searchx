@@ -118,13 +118,17 @@ pub(crate) fn document_id_for_path(relative_path: &str) -> String {
     blake3::hash(relative_path.as_bytes()).to_hex().to_string()
 }
 
-pub fn apply_index_batch(
+pub fn apply_index_batch<U, D>(
     index: &Index,
     indexer_config: &IndexerConfig,
     temp_dir: &Path,
-    upserts: &[String],
-    deleted_ids: &[String],
-) -> SearchxResult<()> {
+    upserts: &[U],
+    deleted_ids: &[D],
+) -> SearchxResult<()>
+where
+    U: AsRef<str>,
+    D: AsRef<str>,
+{
     if upserts.is_empty() && deleted_ids.is_empty() {
         return Ok(());
     }
@@ -136,7 +140,7 @@ pub fn apply_index_batch(
         {
             let mut writer = BufWriter::new(file.as_file_mut());
             for line in upserts {
-                writer.write_all(line.as_bytes())?;
+                writer.write_all(line.as_ref().as_bytes())?;
                 writer.write_all(b"\n")?;
             }
             writer.flush()?;
@@ -163,7 +167,7 @@ pub fn apply_index_batch(
         operations.replace_documents(mmap, MissingDocumentPolicy::default())?;
     }
 
-    let deleted_refs = deleted_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let deleted_refs = deleted_ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>();
     if !deleted_refs.is_empty() {
         operations.delete_documents_by_external_ids(&deleted_refs);
     }

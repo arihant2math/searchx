@@ -148,7 +148,9 @@ fn scan_root_defers_upserts_until_embedding_completes() {
     let jobs = embedding_rx.into_iter().collect::<Vec<_>>();
 
     assert_eq!(events.len(), 1);
-    assert!(matches!(&events[0], IndexEvent::Progress(update) if update.path == "note.txt" && update.entry.embedding_pending()));
+    assert!(
+        matches!(&events[0], IndexEvent::Progress(update) if update.path == "note.txt" && update.entry.embedding_pending())
+    );
 
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].document.path, "note.txt");
@@ -333,7 +335,7 @@ fn sync_repairs_orphaned_documents_after_incomplete_run() {
         &indexer_config,
         &data_paths.base,
         &[serde_json::to_string(&stale_document).unwrap()],
-        &[],
+        &[] as &[&str],
     )
     .unwrap();
     drop(index);

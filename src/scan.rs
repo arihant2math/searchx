@@ -1,5 +1,4 @@
 use crate::api::{ScanError, ScanHook, ScanOptions, SyncStats};
-use crate::embedding::OwnedEmbeddingInput;
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{IndexedDocument, document_id_for_path, empty_document_vectors};
 use crate::manifest::{FileFingerprint, FileState, Manifest, ManifestEntry, SkipReason};
@@ -34,9 +33,16 @@ pub(crate) enum IndexEvent {
 }
 
 #[derive(Debug)]
+pub(crate) enum EmbeddingJobInput {
+    DocumentContents,
+    Text(String),
+    Image(Vec<u8>),
+}
+
+#[derive(Debug)]
 pub(crate) struct EmbeddingJob {
     pub(crate) document: IndexedDocument,
-    pub(crate) input: OwnedEmbeddingInput,
+    pub(crate) input: EmbeddingJobInput,
     pub(crate) progress: ProgressUpdate,
 }
 
@@ -187,11 +193,17 @@ impl<'a> ScanContext<'a> {
             return Ok(());
         };
 
-        if let Some(embedding_input) =
-            supported_binary_embedding_input(&relative_path, path, &bytes)
-        {
-            return self.index_binary_document(&relative_path, path, fingerprint, embedding_input);
-        }
+        let bytes = match supported_binary_embedding_input(&relative_path, path, bytes) {
+            Ok(embedding_input) => {
+                return self.index_binary_document(
+                    &relative_path,
+                    path,
+                    fingerprint,
+                    embedding_input,
+                );
+            }
+            Err(bytes) => bytes,
+        };
 
         if bytes.contains(&0) {
             self.index_metadata_only_document(
@@ -301,7 +313,7 @@ impl<'a> ScanContext<'a> {
             fingerprint,
             FileState::IndexedMetadata { reason },
             String::new(),
-            Some(OwnedEmbeddingInput::Text(metadata_embedding_text(
+            Some(EmbeddingJobInput::Text(metadata_embedding_text(
                 relative_path,
                 path,
             ))),
@@ -313,7 +325,7 @@ impl<'a> ScanContext<'a> {
         relative_path: &str,
         path: &Path,
         fingerprint: FileFingerprint,
-        embedding_input: OwnedEmbeddingInput,
+        embedding_input: EmbeddingJobInput,
     ) -> SearchxResult<()> {
         self.upsert_document(
             relative_path,
@@ -337,8 +349,8 @@ impl<'a> ScanContext<'a> {
             path,
             fingerprint,
             FileState::Indexed,
-            contents.clone(),
-            Some(OwnedEmbeddingInput::Text(contents.clone())),
+            contents,
+            Some(EmbeddingJobInput::DocumentContents),
         )
     }
 
@@ -349,7 +361,7 @@ impl<'a> ScanContext<'a> {
         fingerprint: FileFingerprint,
         final_state: FileState,
         contents: String,
-        embedding_input: Option<OwnedEmbeddingInput>,
+        embedding_input: Option<EmbeddingJobInput>,
     ) -> SearchxResult<()> {
         let embed_async = embedding_input.is_some() && self.embedding_sender.is_some();
         let initial_state = if embed_async {
@@ -530,12 +542,14 @@ fn metadata_embedding_text(relative_path: &str, path: &Path) -> String {
 fn supported_binary_embedding_input(
     relative_path: &str,
     path: &Path,
-    bytes: &[u8],
-) -> Option<OwnedEmbeddingInput> {
-    let extension = path.extension().and_then(OsStr::to_str)?;
+    bytes: Vec<u8>,
+) -> Result<EmbeddingJobInput, Vec<u8>> {
+    let Some(extension) = path.extension().and_then(OsStr::to_str) else {
+        return Err(bytes);
+    };
 
     if extension.eq_ignore_ascii_case("pdf") {
-        return Some(OwnedEmbeddingInput::Text(metadata_embedding_text(
+        return Ok(EmbeddingJobInput::Text(metadata_embedding_text(
             relative_path,
             path,
         )));
@@ -545,10 +559,10 @@ fn supported_binary_embedding_input(
         .iter()
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
     {
-        return Some(OwnedEmbeddingInput::Image(bytes.to_vec()));
+        return Ok(EmbeddingJobInput::Image(bytes));
     }
 
-    None
+    Err(bytes)
 }
 
 fn should_walk_entry(entry: &DirEntry, data_dir: &Path) -> bool {

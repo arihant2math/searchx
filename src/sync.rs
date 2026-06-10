@@ -6,7 +6,6 @@ use crate::constants::{
     INDEX_BATCH_DELETE_LIMIT, INDEX_BATCH_DOC_LIMIT, INDEX_EVENT_CHANNEL_CAPACITY,
     MANIFEST_BATCH_ENTRY_LIMIT, PROGRESS_POLL_INTERVAL,
 };
-use crate::embedding::OwnedEmbeddingInput;
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{
     apply_index_batch, configure_index, document_id_for_path, embedded_document_vectors,
@@ -17,7 +16,9 @@ use crate::manifest::{
     load_manifest, load_working_manifest, mark_index_incomplete, open_manifest_connection,
     reset_data_dir,
 };
-use crate::scan::{EmbeddingJob, IndexEvent, ProgressUpdate, ScanPipeline, scan_root};
+use crate::scan::{
+    EmbeddingJob, EmbeddingJobInput, IndexEvent, ProgressUpdate, ScanPipeline, scan_root,
+};
 use milli::update::IndexerConfig;
 use milli::{Index, all_obkv_to_json};
 use std::any::Any;
@@ -45,11 +46,11 @@ impl PendingIndexBatch {
                 progress,
             } => {
                 let document_len = document.len();
-                if let Some(previous) = self.upserts.insert(document_id.clone(), document) {
+                self.deleted_ids.remove(&document_id);
+                if let Some(previous) = self.upserts.insert(document_id, document) {
                     self.bytes = self.bytes.saturating_sub(previous.len());
                 }
                 self.bytes += document_len;
-                self.deleted_ids.remove(&document_id);
                 if let Some(progress) = progress {
                     self.progress_updates.push(progress);
                 }
@@ -92,8 +93,16 @@ impl PendingIndexBatch {
         }
 
         if !self.upserts.is_empty() || !self.deleted_ids.is_empty() {
-            let upserts = self.upserts.values().cloned().collect::<Vec<_>>();
-            let deleted_ids = self.deleted_ids.iter().cloned().collect::<Vec<_>>();
+            let upserts = self
+                .upserts
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let deleted_ids = self
+                .deleted_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             apply_index_batch(
                 index,
                 indexer_config,
@@ -187,11 +196,13 @@ fn finish_embedding_thread(
 fn emit_embedded_document(
     event_tx: &mpsc::SyncSender<IndexEvent>,
     job: EmbeddingJob,
-    vector: Vec<f32>,
+    vector: Option<Vec<f32>>,
 ) -> SearchxResult<()> {
     let mut document = job.document;
     let document_id = document.id.clone();
-    document.vectors = embedded_document_vectors(vector);
+    if let Some(vector) = vector {
+        document.vectors = embedded_document_vectors(vector);
+    }
     event_tx
         .send(IndexEvent::Upsert {
             document_id,
@@ -199,6 +210,43 @@ fn emit_embedded_document(
             progress: Some(job.progress),
         })
         .map_err(|_| SearchxError::IndexingPipelineDisconnected)
+}
+
+fn embed_single_text(
+    embedder: &mut crate::embedding::Embedder,
+    text: &str,
+) -> SearchxResult<Vec<f32>> {
+    embedder
+        .embed_texts(&[text])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| SearchxError::Embedding {
+            message: "text embedder returned no vectors".to_string(),
+        })
+}
+
+fn embed_single_image(
+    embedder: &mut crate::embedding::Embedder,
+    bytes: &[u8],
+) -> SearchxResult<Vec<f32>> {
+    embedder
+        .embed_images(&[bytes])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| SearchxError::Embedding {
+            message: "image embedder returned no vectors".to_string(),
+        })
+}
+
+fn embed_job(
+    embedder: &mut crate::embedding::Embedder,
+    job: &EmbeddingJob,
+) -> SearchxResult<Vec<f32>> {
+    match &job.input {
+        EmbeddingJobInput::DocumentContents => embed_single_text(embedder, &job.document.contents),
+        EmbeddingJobInput::Text(text) => embed_single_text(embedder, text),
+        EmbeddingJobInput::Image(bytes) => embed_single_image(embedder, bytes),
+    }
 }
 
 fn embed_text_jobs(
@@ -210,9 +258,16 @@ fn embed_text_jobs(
     let mut text_inputs = Vec::new();
 
     for (index, job) in pending_jobs.iter().enumerate() {
-        if let OwnedEmbeddingInput::Text(text) = &job.input {
-            text_indices.push(index);
-            text_inputs.push(text.as_str());
+        match &job.input {
+            EmbeddingJobInput::DocumentContents => {
+                text_indices.push(index);
+                text_inputs.push(job.document.contents.as_str());
+            }
+            EmbeddingJobInput::Text(text) => {
+                text_indices.push(index);
+                text_inputs.push(text.as_str());
+            }
+            EmbeddingJobInput::Image(_) => {}
         }
     }
 
@@ -233,7 +288,7 @@ fn embed_text_jobs(
                 error
             );
             for index in text_indices {
-                match embedder.embed(&pending_jobs[index].input) {
+                match embed_job(embedder, &pending_jobs[index]) {
                     Ok(vector) => vectors[index] = Some(vector),
                     Err(error) => {
                         eprintln!(
@@ -256,7 +311,7 @@ fn embed_image_jobs(
     let mut image_inputs = Vec::new();
 
     for (index, job) in pending_jobs.iter().enumerate() {
-        if let OwnedEmbeddingInput::Image(bytes) = &job.input {
+        if let EmbeddingJobInput::Image(bytes) = &job.input {
             image_indices.push(index);
             image_inputs.push(bytes.as_slice());
         }
@@ -279,7 +334,7 @@ fn embed_image_jobs(
                 error
             );
             for index in image_indices {
-                match embedder.embed(&pending_jobs[index].input) {
+                match embed_job(embedder, &pending_jobs[index]) {
                     Ok(vector) => vectors[index] = Some(vector),
                     Err(error) => {
                         eprintln!(
@@ -307,9 +362,7 @@ fn flush_embedding_jobs(
     embed_image_jobs(embedder, pending_jobs, &mut vectors);
 
     for (job, vector) in pending_jobs.drain(..).zip(vectors) {
-        if let Some(vector) = vector {
-            emit_embedded_document(event_tx, job, vector)?;
-        }
+        emit_embedded_document(event_tx, job, vector)?;
     }
 
     Ok(())
@@ -404,7 +457,13 @@ fn repair_index_from_working_manifest(
     drop(rtxn);
 
     if !orphaned_ids.is_empty() {
-        apply_index_batch(index, indexer_config, &data_paths.base, &[], &orphaned_ids)?;
+        apply_index_batch(
+            index,
+            indexer_config,
+            &data_paths.base,
+            &[] as &[&str],
+            &orphaned_ids,
+        )?;
     }
 
     Ok(())
@@ -498,9 +557,12 @@ where
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) =
-                    pending_batch.flush(index, indexer_config, Some(&mut progress_manifest), data_paths)
-                {
+                if let Err(error) = pending_batch.flush(
+                    index,
+                    indexer_config,
+                    Some(&mut progress_manifest),
+                    data_paths,
+                ) {
                     cancel_flag.store(true, Ordering::Relaxed);
                     drop(event_rx);
                     let _ = finish_scan_thread(scan_handle);
@@ -522,7 +584,12 @@ where
 
     drain_scan_errors(&scan_error_rx, on_progress);
 
-    pending_batch.flush(index, indexer_config, Some(&mut progress_manifest), data_paths)?;
+    pending_batch.flush(
+        index,
+        indexer_config,
+        Some(&mut progress_manifest),
+        data_paths,
+    )?;
 
     Ok(scan_result)
 }
