@@ -64,7 +64,6 @@ fn run() -> SearchxResult<()> {
             rebuild: args.rebuild,
             max_file_bytes: args.max_file_bytes,
             ignore_rules,
-            ..ScanOptions::default()
         });
 
     let result = sync_index_with_progress(&request, |progress| match progress {
