@@ -2,14 +2,15 @@ use crate::api::{ScanError, ScanHook, ScanOptions, SyncStats};
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{IndexedDocument, document_id_for_path, empty_document_vectors};
 use crate::manifest::{FileFingerprint, FileState, Manifest, ManifestEntry, SkipReason};
+use crossbeam_channel as channel;
 use ignore::{DirEntry, WalkBuilder};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone)]
@@ -47,9 +48,9 @@ pub(crate) struct EmbeddingJob {
 
 #[derive(Debug)]
 pub(crate) struct ScanPipeline {
-    pub(crate) error_sender: Option<mpsc::Sender<ScanError>>,
-    pub(crate) event_sender: mpsc::SyncSender<IndexEvent>,
-    pub(crate) embedding_sender: Option<mpsc::SyncSender<EmbeddingJob>>,
+    pub(crate) error_sender: Option<channel::Sender<ScanError>>,
+    pub(crate) event_sender: channel::Sender<IndexEvent>,
+    pub(crate) embedding_sender: Option<channel::Sender<EmbeddingJob>>,
     pub(crate) cancel_flag: Arc<AtomicBool>,
 }
 
@@ -69,9 +70,9 @@ struct ScanContext<'a> {
     root: &'a Path,
     previous: &'a Manifest,
     scan_hook: Option<&'a ScanHook>,
-    error_sender: Option<&'a mpsc::Sender<ScanError>>,
-    event_sender: &'a mpsc::SyncSender<IndexEvent>,
-    embedding_sender: Option<&'a mpsc::SyncSender<EmbeddingJob>>,
+    error_sender: Option<&'a channel::Sender<ScanError>>,
+    event_sender: &'a channel::Sender<IndexEvent>,
+    embedding_sender: Option<&'a channel::Sender<EmbeddingJob>>,
     cancel_flag: &'a AtomicBool,
     seen_paths: HashSet<String>,
     stats: SyncStats,
@@ -444,7 +445,7 @@ impl<'a> ScanContext<'a> {
 }
 
 fn send_index_event(
-    event_sender: &mpsc::SyncSender<IndexEvent>,
+    event_sender: &channel::Sender<IndexEvent>,
     cancel_flag: &AtomicBool,
     event: IndexEvent,
 ) -> SearchxResult<()> {
@@ -458,7 +459,7 @@ fn send_index_event(
 }
 
 fn send_progress_event(
-    event_sender: &mpsc::SyncSender<IndexEvent>,
+    event_sender: &channel::Sender<IndexEvent>,
     cancel_flag: &AtomicBool,
     relative_path: &str,
     entry: &ManifestEntry,
@@ -474,7 +475,7 @@ fn send_progress_event(
 }
 
 fn send_embedding_job(
-    embedding_sender: &mpsc::SyncSender<EmbeddingJob>,
+    embedding_sender: &channel::Sender<EmbeddingJob>,
     cancel_flag: &AtomicBool,
     job: EmbeddingJob,
 ) -> SearchxResult<()> {
@@ -487,7 +488,7 @@ fn send_embedding_job(
         .map_err(|_| SearchxError::IndexingPipelineDisconnected)
 }
 
-fn report_scan_error(error_sender: Option<&mpsc::Sender<ScanError>>, error: ScanError) {
+fn report_scan_error(error_sender: Option<&channel::Sender<ScanError>>, error: ScanError) {
     if let Some(error_sender) = error_sender {
         let _ = error_sender.send(error);
     } else {

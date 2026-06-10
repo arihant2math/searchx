@@ -11,6 +11,7 @@ path = "src/lib.rs"
 blake3 = "1.8.2"
 bumpalo = "3.19.0"
 clap = { version = "4.5.40", features = ["derive"] }
+crossbeam-channel = "0.5.15"
 fastembed = "5.16.0"
 http-client = { git = "https://github.com/meilisearch/meilisearch.git", tag = "v1.46.1", package = "http-client" }
 ignore = "0.4.25"

@@ -4152,6 +4152,7 @@ dependencies = [
  "blake3",
  "bumpalo",
  "clap",
+ "crossbeam-channel",
  "fastembed",
  "http-client",
  "ignore",

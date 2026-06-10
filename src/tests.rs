@@ -1,10 +1,11 @@
 use super::*;
+use crossbeam_channel as channel;
 use rusqlite::params;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, mpsc};
 use tempfile::TempDir;
 
 fn empty_manifest(root: &Path) -> Manifest {
@@ -25,7 +26,7 @@ fn setup_scan_dirs() -> (TempDir, PathBuf, PathBuf) {
 }
 
 fn streamed_indexed_paths(options: &ScanOptions, root: &Path, data_dir: &Path) -> BTreeSet<String> {
-    let (event_tx, event_rx) = mpsc::sync_channel(32);
+    let (event_tx, event_rx) = channel::bounded(32);
     scan_root(
         options,
         root,
@@ -120,8 +121,8 @@ fn scan_root_defers_upserts_until_embedding_completes() {
         max_file_bytes: u64::MAX,
         ignore_rules: Vec::new(),
     };
-    let (event_tx, event_rx) = mpsc::sync_channel(32);
-    let (embedding_tx, embedding_rx) = mpsc::sync_channel(32);
+    let (event_tx, event_rx) = channel::bounded(32);
+    let (embedding_tx, embedding_rx) = channel::bounded(32);
 
     scan_root(
         &options,
