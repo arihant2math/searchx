@@ -118,6 +118,40 @@ pub(crate) fn document_id_for_path(relative_path: &str) -> String {
     blake3::hash(relative_path.as_bytes()).to_hex().to_string()
 }
 
+pub trait IndexBatchDocument {
+    fn write_ndjson_line<W: Write>(&self, writer: &mut W) -> SearchxResult<()>;
+}
+
+impl IndexBatchDocument for IndexedDocument {
+    fn write_ndjson_line<W: Write>(&self, writer: &mut W) -> SearchxResult<()> {
+        serde_json::to_writer(&mut *writer, self)?;
+        writer.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+impl IndexBatchDocument for &IndexedDocument {
+    fn write_ndjson_line<W: Write>(&self, writer: &mut W) -> SearchxResult<()> {
+        (*self).write_ndjson_line(writer)
+    }
+}
+
+impl IndexBatchDocument for String {
+    fn write_ndjson_line<W: Write>(&self, writer: &mut W) -> SearchxResult<()> {
+        writer.write_all(self.as_bytes())?;
+        writer.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+impl IndexBatchDocument for &str {
+    fn write_ndjson_line<W: Write>(&self, writer: &mut W) -> SearchxResult<()> {
+        writer.write_all(self.as_bytes())?;
+        writer.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
 pub fn apply_index_batch<U, D>(
     index: &Index,
     indexer_config: &IndexerConfig,
@@ -126,7 +160,7 @@ pub fn apply_index_batch<U, D>(
     deleted_ids: &[D],
 ) -> SearchxResult<()>
 where
-    U: AsRef<str>,
+    U: IndexBatchDocument,
     D: AsRef<str>,
 {
     if upserts.is_empty() && deleted_ids.is_empty() {
@@ -139,9 +173,8 @@ where
         let mut file = NamedTempFile::new_in(temp_dir)?;
         {
             let mut writer = BufWriter::new(file.as_file_mut());
-            for line in upserts {
-                writer.write_all(line.as_ref().as_bytes())?;
-                writer.write_all(b"\n")?;
+            for document in upserts {
+                document.write_ndjson_line(&mut writer)?;
             }
             writer.flush()?;
         }

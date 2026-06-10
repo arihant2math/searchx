@@ -44,10 +44,7 @@ fn streamed_indexed_paths(options: &ScanOptions, root: &Path, data_dir: &Path) -
     event_rx
         .into_iter()
         .filter_map(|event| match event {
-            IndexEvent::Upsert { document, .. } => {
-                let value: serde_json::Value = serde_json::from_str(&document).unwrap();
-                Some(value["path"].as_str().unwrap().to_string())
-            }
+            IndexEvent::Upsert { document, .. } => Some(document.path),
             IndexEvent::Delete { .. } | IndexEvent::Progress(_) => None,
         })
         .collect()

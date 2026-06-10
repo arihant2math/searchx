@@ -21,8 +21,7 @@ pub(crate) struct ProgressUpdate {
 #[derive(Debug)]
 pub(crate) enum IndexEvent {
     Upsert {
-        document_id: String,
-        document: String,
+        document: IndexedDocument,
         progress: Option<ProgressUpdate>,
     },
     Delete {
@@ -409,8 +408,7 @@ impl<'a> ScanContext<'a> {
                 self.event_sender,
                 self.cancel_flag,
                 IndexEvent::Upsert {
-                    document_id: document.id.clone(),
-                    document: simd_json::to_string(&document)?,
+                    document,
                     progress: Some(ProgressUpdate {
                         path: relative_path.to_string(),
                         entry: initial_entry,

@@ -8,8 +8,8 @@ use crate::constants::{
 };
 use crate::error::{SearchxError, SearchxResult};
 use crate::index::{
-    apply_index_batch, configure_index, document_id_for_path, embedded_document_vectors,
-    new_heed_options,
+    IndexedDocument, apply_index_batch, configure_index, document_id_for_path,
+    embedded_document_vectors, new_heed_options,
 };
 use crate::manifest::{
     Manifest, ManifestWorkingSet, clear_index_incomplete, commit_working_manifest, data_paths,
@@ -31,24 +31,40 @@ use std::thread;
 
 #[derive(Default)]
 struct PendingIndexBatch {
-    upserts: BTreeMap<String, String>,
+    upserts: BTreeMap<String, IndexedDocument>,
     deleted_ids: BTreeSet<String>,
     progress_updates: Vec<ProgressUpdate>,
     bytes: usize,
 }
 
+fn estimated_document_bytes(document: &IndexedDocument) -> usize {
+    let vector_bytes = document
+        .vectors
+        .values()
+        .filter_map(Option::as_ref)
+        .map(|vector| vector.len() * std::mem::size_of::<f32>())
+        .sum::<usize>();
+
+    document.id.len()
+        + document.path.len()
+        + document.file_name.len()
+        + document.extension.as_ref().map_or(0, String::len)
+        + document.contents.len()
+        + vector_bytes
+        + 256
+}
+
 impl PendingIndexBatch {
     fn push(&mut self, event: IndexEvent) {
         match event {
-            IndexEvent::Upsert {
-                document_id,
-                document,
-                progress,
-            } => {
-                let document_len = document.len();
+            IndexEvent::Upsert { document, progress } => {
+                let document_id = document.id.clone();
+                let document_len = estimated_document_bytes(&document);
                 self.deleted_ids.remove(&document_id);
                 if let Some(previous) = self.upserts.insert(document_id, document) {
-                    self.bytes = self.bytes.saturating_sub(previous.len());
+                    self.bytes = self
+                        .bytes
+                        .saturating_sub(estimated_document_bytes(&previous));
                 }
                 self.bytes += document_len;
                 if let Some(progress) = progress {
@@ -60,7 +76,9 @@ impl PendingIndexBatch {
                 progress,
             } => {
                 if let Some(previous) = self.upserts.remove(&document_id) {
-                    self.bytes = self.bytes.saturating_sub(previous.len());
+                    self.bytes = self
+                        .bytes
+                        .saturating_sub(estimated_document_bytes(&previous));
                 }
                 self.deleted_ids.insert(document_id);
                 if let Some(progress) = progress {
@@ -93,11 +111,7 @@ impl PendingIndexBatch {
         }
 
         if !self.upserts.is_empty() || !self.deleted_ids.is_empty() {
-            let upserts = self
-                .upserts
-                .values()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
+            let upserts = self.upserts.values().collect::<Vec<_>>();
             let deleted_ids = self
                 .deleted_ids
                 .iter()
@@ -199,14 +213,12 @@ fn emit_embedded_document(
     vector: Option<Vec<f32>>,
 ) -> SearchxResult<()> {
     let mut document = job.document;
-    let document_id = document.id.clone();
     if let Some(vector) = vector {
         document.vectors = embedded_document_vectors(vector);
     }
     event_tx
         .send(IndexEvent::Upsert {
-            document_id,
-            document: serde_json::to_string(&document)?,
+            document,
             progress: Some(job.progress),
         })
         .map_err(|_| SearchxError::IndexingPipelineDisconnected)
