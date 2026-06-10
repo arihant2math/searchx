@@ -44,10 +44,11 @@ impl PendingIndexBatch {
                 document,
                 progress,
             } => {
-                if let Some(previous) = self.upserts.insert(document_id.clone(), document.clone()) {
+                let document_len = document.len();
+                if let Some(previous) = self.upserts.insert(document_id.clone(), document) {
                     self.bytes = self.bytes.saturating_sub(previous.len());
                 }
-                self.bytes += document.len();
+                self.bytes += document_len;
                 self.deleted_ids.remove(&document_id);
                 if let Some(progress) = progress {
                     self.progress_updates.push(progress);
