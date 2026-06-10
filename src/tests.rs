@@ -331,7 +331,7 @@ fn sync_repairs_orphaned_documents_after_incomplete_run() {
         &index,
         &indexer_config,
         &data_paths.base,
-        &[serde_json::to_string(&stale_document).unwrap()],
+        &[simd_json::to_string(&stale_document).unwrap()],
         &[] as &[&str],
     )
     .unwrap();
