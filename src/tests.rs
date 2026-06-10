@@ -114,6 +114,47 @@ fn scan_root_still_indexes_binary_files_by_name() {
 }
 
 #[test]
+fn scan_root_defers_upserts_until_embedding_completes() {
+    let (_temp_dir, root, data_dir) = setup_scan_dirs();
+    fs::write(root.join("note.txt"), "hello world").unwrap();
+
+    let options = ScanOptions {
+        rebuild: false,
+        max_file_bytes: u64::MAX,
+        ignore_rules: Vec::new(),
+    };
+    let (event_tx, event_rx) = mpsc::sync_channel(32);
+    let (embedding_tx, embedding_rx) = mpsc::sync_channel(32);
+
+    scan_root(
+        &options,
+        &root,
+        &data_dir,
+        &empty_manifest(&root),
+        None,
+        &ScanPipeline {
+            error_sender: None,
+            event_sender: event_tx.clone(),
+            embedding_sender: Some(embedding_tx.clone()),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        },
+    )
+    .unwrap();
+
+    drop(event_tx);
+    drop(embedding_tx);
+
+    let events = event_rx.into_iter().collect::<Vec<_>>();
+    let jobs = embedding_rx.into_iter().collect::<Vec<_>>();
+
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], IndexEvent::Progress(update) if update.path == "note.txt" && update.entry.embedding_pending()));
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].document.path, "note.txt");
+}
+
+#[test]
 fn load_manifest_resumes_from_working_state_when_previous_run_was_incomplete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().join("root");

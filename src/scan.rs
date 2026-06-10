@@ -351,11 +351,14 @@ impl<'a> ScanContext<'a> {
         contents: String,
         embedding_input: Option<OwnedEmbeddingInput>,
     ) -> SearchxResult<()> {
-        let initial_state = if embedding_input.is_some() && self.embedding_sender.is_some() {
+        let embed_async = embedding_input.is_some() && self.embedding_sender.is_some();
+        let initial_state = if embed_async {
             pending_embedding_state(&final_state)
         } else {
             final_state.clone()
         };
+        let initial_entry = ManifestEntry::from_fingerprint(fingerprint, initial_state);
+        let final_entry = ManifestEntry::from_fingerprint(fingerprint, final_state);
 
         let document = IndexedDocument {
             id: document_id_for_path(relative_path),
@@ -369,22 +372,14 @@ impl<'a> ScanContext<'a> {
             contents,
             vectors: empty_document_vectors(),
         };
-        let document_id = document.id.clone();
-
-        send_index_event(
-            self.event_sender,
-            self.cancel_flag,
-            IndexEvent::Upsert {
-                document_id,
-                document: simd_json::to_string(&document)?,
-                progress: Some(ProgressUpdate {
-                    path: relative_path.to_string(),
-                    entry: ManifestEntry::from_fingerprint(fingerprint, initial_state),
-                }),
-            },
-        )?;
 
         if let (Some(embedding_sender), Some(input)) = (self.embedding_sender, embedding_input) {
+            send_progress_event(
+                self.event_sender,
+                self.cancel_flag,
+                relative_path,
+                &initial_entry,
+            )?;
             send_embedding_job(
                 embedding_sender,
                 self.cancel_flag,
@@ -393,8 +388,21 @@ impl<'a> ScanContext<'a> {
                     input,
                     progress: ProgressUpdate {
                         path: relative_path.to_string(),
-                        entry: ManifestEntry::from_fingerprint(fingerprint, final_state),
+                        entry: final_entry,
                     },
+                },
+            )?;
+        } else {
+            send_index_event(
+                self.event_sender,
+                self.cancel_flag,
+                IndexEvent::Upsert {
+                    document_id: document.id.clone(),
+                    document: simd_json::to_string(&document)?,
+                    progress: Some(ProgressUpdate {
+                        path: relative_path.to_string(),
+                        entry: initial_entry,
+                    }),
                 },
             )?;
         }
